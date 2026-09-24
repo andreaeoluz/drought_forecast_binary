@@ -1,0 +1,15 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pkl
+
+# Generated experiment artifacts (checkpoints, SPI cache, grid-search
+# results, inference rasters) - reproducible by running main.py, and can
+# be many GB; never commit them.
+outputs/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

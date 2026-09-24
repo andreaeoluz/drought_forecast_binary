@@ -1,9 +1,8 @@
-"""metrics.py - Métricas para classificação binária"""
+"""metrics.py - Binary classification metrics."""
 
 import math
 from typing import Dict, Optional, List, Tuple
 import numpy as np
-import torch
 
 
 def compute_confusion_matrix(
@@ -11,12 +10,12 @@ def compute_confusion_matrix(
     targets: np.ndarray,
 ) -> Tuple[int, int, int, int]:
     """
-    Calcula matriz de confusão.
-    
+    Compute the confusion matrix.
+
     Args:
-        preds: Array de previsões (0/1)
-        targets: Array de alvos (0/1)
-    
+        preds: Predictions array (0/1).
+        targets: Targets array (0/1).
+
     Returns:
         (tp, fp, fn, tn)
     """
@@ -24,91 +23,67 @@ def compute_confusion_matrix(
     fp = np.sum((preds == 1) & (targets == 0))
     fn = np.sum((preds == 0) & (targets == 1))
     tn = np.sum((preds == 0) & (targets == 0))
-    
+
     return int(tp), int(fp), int(fn), int(tn)
 
 
 def compute_metrics(
-    tp: int, 
-    fp: int, 
-    fn: int, 
+    tp: int,
+    fp: int,
+    fn: int,
     tn: int,
 ) -> Dict[str, float]:
-    """
-    Calcula métricas a partir da matriz de confusão.
-    """
+    """Compute classification metrics from a confusion matrix."""
     eps = 1e-7
-    
-    # Converter para float
+
     tp_f = float(tp)
     fp_f = float(fp)
     fn_f = float(fn)
     tn_f = float(tn)
-    
-    # CSI
+
     csi = tp_f / (tp_f + fp_f + fn_f + eps)
-    
-    # Precision
     precision = tp_f / (tp_f + fp_f + eps)
-    
-    # Recall
     recall = tp_f / (tp_f + fn_f + eps)
-    
-    # FAR
     far = fp_f / (tp_f + fp_f + eps)
-    
-    # Bias
     bias = (tp_f + fp_f) / (tp_f + fn_f + eps)
-    
-    # --- MCC ROBUSTO ---
+
+    # --- MCC, guarded against degenerate confusion matrices ---
     total = tp_f + fp_f + fn_f + tn_f
-    
-    # Se total for zero, retornar 0
+
     if total < eps:
         mcc = 0.0
     else:
-        # Calcular numerator
         numerator = (tp_f * tn_f) - (fp_f * fn_f)
-        
-        # Calcular denominador com proteção
+
         denom_tp_fp = max(tp_f + fp_f, 0.0)
         denom_tp_fn = max(tp_f + fn_f, 0.0)
         denom_tn_fp = max(tn_f + fp_f, 0.0)
         denom_tn_fn = max(tn_f + fn_f, 0.0)
-        
+
         product = denom_tp_fp * denom_tp_fn * denom_tn_fp * denom_tn_fn
-        
-        # Se produto for zero, MCC = 0 (não há informação suficiente)
+
         if product < eps:
+            # Not enough information to compute a meaningful MCC.
             mcc = 0.0
         else:
             denominator = math.sqrt(product)
             mcc = numerator / denominator
-            
-            # Garantir que MCC esteja no intervalo [-1, 1]
             mcc = max(-1.0, min(1.0, mcc))
-    
-    # Accuracy
+
     accuracy = (tp_f + tn_f) / (total + eps)
-    
-    # TPR e TNR
+
     tpr = recall
     tnr = tn_f / (tn_f + fp_f + eps)
-    
-    # Balanced Accuracy
     balanced_accuracy = (tpr + tnr) / 2
-    
-    # F1
+
     f1 = 2 * (precision * recall) / (precision + recall + eps)
-    
-    # Informedness
+
     informedness = tpr + tnr - 1
-    
-    # Markedness
+
     ppv = precision
     npv = tn_f / (tn_f + fn_f + eps)
     markedness = ppv + npv - 1
-    
+
     return {
         "csi": round(csi, 6),
         "precision": round(precision, 6),
@@ -129,81 +104,73 @@ def compute_metrics(
     }
 
 
-# ✅ FUNÇÃO AUXILIAR: calcular métricas a partir de preds e targets
 def compute_metrics_from_arrays(
     preds: np.ndarray,
     targets: np.ndarray,
 ) -> Dict[str, float]:
-    """
-    Calcula métricas diretamente de arrays de predições e targets.
-    
-    Args:
-        preds: Array de previsões (0/1)
-        targets: Array de alvos (0/1)
-    
-    Returns:
-        Dicionário com métricas
-    """
+    """Compute metrics directly from prediction and target arrays."""
     tp, fp, fn, tn = compute_confusion_matrix(preds, targets)
     return compute_metrics(tp, fp, fn, tn)
 
 
 def aggregate_metrics(confusion_list: List[Tuple[int, int, int, int]]) -> Dict[str, float]:
-    """Agrega múltiplas matrizes de confusão."""
+    """Aggregate multiple confusion matrices into a single set of metrics."""
     tp = sum(c[0] for c in confusion_list)
     fp = sum(c[1] for c in confusion_list)
     fn = sum(c[2] for c in confusion_list)
     tn = sum(c[3] for c in confusion_list)
-    
+
     return compute_metrics(tp, fp, fn, tn)
 
 
 def find_best_threshold(probs, targets, thresholds=None, metric='mcc'):
     """
-    Encontra o melhor threshold baseado na métrica especificada.
-    
+    Find the decision threshold that maximizes the given metric.
+
     Args:
-        metric: 'mcc', 'csi', 'f1', etc.
+        probs: Predicted probabilities.
+        targets: Binary targets.
+        thresholds: Candidate thresholds. If None, an adaptive range is
+            derived from the probability distribution.
+        metric: 'mcc', 'csi', or any other key returned by compute_metrics.
+
+    Returns:
+        (best_threshold, best_metrics)
     """
     if thresholds is None:
-        # Range adaptativo
         p1 = np.percentile(probs, 1)
         p99 = np.percentile(probs, 99)
         low = max(0.001, p1 - 0.02)
         high = min(0.999, p99 + 0.02)
         thresholds = np.arange(low, high + 0.005, 0.005)
-    
+
     best_score = -1.0
     best_thr = thresholds[0]
     best_metrics = None
-    
+
     for thr in thresholds:
         preds = (probs >= thr).astype(np.int32)
-        
-        # ✅ USAR compute_metrics_from_arrays para obter métricas
         metrics = compute_metrics_from_arrays(preds, targets)
-        
-        # ✅ Priorizar MCC para seleção
+
         if metric == 'mcc':
             score = metrics.get('mcc', 0.0)
         elif metric == 'csi':
             score = metrics.get('csi', 0.0)
         else:
             score = metrics.get(metric, 0.0)
-        
-        # Desempate: se MCC igual, usar CSI
+
         if score > best_score:
             best_score = score
             best_thr = thr
             best_metrics = metrics
         elif abs(score - best_score) < 1e-6:
-            # Desempate por CSI
+            # Break ties by preferring the higher CSI.
             current_csi = metrics.get('csi', 0.0)
             best_csi = best_metrics.get('csi', 0.0) if best_metrics else 0.0
             if current_csi > best_csi:
                 best_thr = thr
                 best_metrics = metrics
-    
+
     return best_thr, best_metrics
 
 
@@ -215,26 +182,28 @@ def compute_metrics_with_postprocessing(
     valid_mask: Optional[np.ndarray] = None,
 ) -> Dict:
     """
-    Calcula métricas com pós-processamento espacial.
-    
-    Aplica remoção de pequenos objetos antes de calcular as métricas.
-    
+    Compute metrics after spatial post-processing (small-object removal).
+
     Args:
-        probs: Probabilidades (H, W)
-        targets: Targets binários (H, W)
-        threshold: Limiar de binarização
-        min_area: Área mínima para manter um componente
-        valid_mask: Máscara de pixels válidos (opcional)
-    
+        probs: Probabilities (H, W).
+        targets: Binary targets (H, W).
+        threshold: Binarization threshold.
+        min_area: Minimum area to keep a connected component.
+        valid_mask: Optional validity mask.
+
     Returns:
-        Dicionário com métricas calculadas
+        Dict of computed metrics.
     """
     from utils.spatial import postprocess_binary_mask
-    
-    # Binarizar
-    binary = (probs > threshold).astype(np.uint8)
-    
-    # Aplicar pós-processamento
+
+    # Copy before mutating in place, since `targets` may be the caller's array.
+    targets = targets.copy()
+
+    # Same boundary convention as find_best_threshold (probs >= thr), so
+    # metrics computed with vs. without post-processing at the same
+    # threshold value are directly comparable pixel-for-pixel.
+    binary = (probs >= threshold).astype(np.uint8)
+
     if binary.sum() > 0:
         binary = postprocess_binary_mask(
             binary.astype(np.float32),
@@ -243,11 +212,9 @@ def compute_metrics_with_postprocessing(
             hole_area=max(1, min_area // 2),
         )
         binary = binary.astype(np.uint8)
-    
-    # Aplicar máscara de validade
+
     if valid_mask is not None:
         binary[~valid_mask] = 0
         targets[~valid_mask] = 0
-    
-    # ✅ USAR compute_metrics_from_arrays
+
     return compute_metrics_from_arrays(binary, targets)

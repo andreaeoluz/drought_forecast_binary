@@ -1,10 +1,11 @@
 """base.py - Base trainer class."""
 
-import torch
-import numpy as np
 import random
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict
+
+import numpy as np
+import torch
 
 from config import ExperimentConfig
 from utils import set_reproducible_seeds
@@ -28,23 +29,23 @@ class BaseTrainer:
         self.save_path = save_path
         self.device = config.device
         self.model.to(self.device)
-        
+
         set_reproducible_seeds(config.random_seed, deterministic=True)
 
     def create_dataloaders(self, shuffle_train: bool = True):
         """Create deterministic DataLoaders."""
         batch_size = self.config.training.batch_size
         seed = self.config.random_seed
-        
+
         g = torch.Generator()
         g.manual_seed(seed)
-        
+
         def worker_init_fn(worker_id):
             worker_seed = seed + worker_id
             np.random.seed(worker_seed)
             random.seed(worker_seed)
             torch.manual_seed(worker_seed)
-        
+
         if shuffle_train and hasattr(self.train_dataset, 'sample_weights') and self.train_dataset.sample_weights is not None:
             weights = torch.as_tensor(self.train_dataset.sample_weights, dtype=torch.double)
             sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights), replacement=True, generator=g)
@@ -66,7 +67,7 @@ class BaseTrainer:
                 worker_init_fn=worker_init_fn,
                 generator=g,
             )
-        
+
         val_loader = torch.utils.data.DataLoader(
             self.val_dataset,
             batch_size=batch_size,
@@ -75,13 +76,13 @@ class BaseTrainer:
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
         )
-        
+
         return train_loader, val_loader
 
     def save_checkpoint(self, epoch: int, metrics: Dict[str, Any]):
         """Save model checkpoint."""
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),

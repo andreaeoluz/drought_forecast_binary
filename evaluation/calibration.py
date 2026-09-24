@@ -1,20 +1,32 @@
 """calibration.py - Probability calibration methods."""
 
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.isotonic import IsotonicRegression
-from sklearn.base import BaseEstimator, TransformerMixin
 from typing import Optional, Union
+
+import numpy as np
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
 
 class PlattCalibrator:
     """Platt Scaling (Logistic Regression) for probability calibration."""
 
-    def __init__(self, C: float = 0.1, max_iter: int = 1000, random_state: int = 42):
+    def __init__(
+        self,
+        C: float = 0.1,
+        max_iter: int = 1000,
+        random_state: int = 42,
+        class_weight: Optional[Union[str, dict]] = None,
+    ):
+        # class_weight defaults to None (unweighted): Platt scaling is meant
+        # to learn the true mapping from raw score to empirical frequency.
+        # Balancing classes here would fit the calibrator to an artificial
+        # 50/50 distribution instead of the real (often ~2-15%) drought
+        # prevalence, actively working against calibration's own purpose.
+        # Pass class_weight='balanced' explicitly if that's ever needed.
         self.model = LogisticRegression(
             C=C,
             max_iter=max_iter,
-            class_weight='balanced',
+            class_weight=class_weight,
             random_state=random_state,
         )
         self._fitted = False

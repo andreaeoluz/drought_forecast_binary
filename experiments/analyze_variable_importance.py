@@ -14,15 +14,17 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import warnings
+from typing import Dict, Tuple
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
-from typing import Dict, Tuple, Optional, List
-import warnings
-warnings.filterwarnings('ignore')
 
-from config import ExperimentConfig, get_paths, get_data_path
+from config import ExperimentConfig, get_data_path, get_paths
+
+warnings.filterwarnings('ignore')
 from data import load_region_timeseries
 from data.spi import load_spi_cache, compute_spi
 from utils import set_reproducible_seeds
@@ -107,7 +109,7 @@ class VariableImportanceAnalyzer:
         valid_pixels = valid_mask.sum()
         invalid_pixels = total_pixels - valid_pixels
 
-        self.logger.info(f"\n📊 Validity Mask:")
+        self.logger.info("\n📊 Validity Mask:")
         self.logger.info(f"   Total pixels: {total_pixels:,}")
         self.logger.info(f"   Valid: {valid_pixels:,} ({valid_pixels/total_pixels:.1%})")
         self.logger.info(f"   Invalid: {invalid_pixels:,} ({invalid_pixels/total_pixels:.1%})")
@@ -118,7 +120,7 @@ class VariableImportanceAnalyzer:
             zero_pixels = (first_band == 0)
             zero_valid = zero_pixels & valid_mask
 
-            self.logger.info(f"\n📊 Zero-value (non-drought) pixels:")
+            self.logger.info("\n📊 Zero-value (non-drought) pixels:")
             self.logger.info(f"   Total: {zero_pixels.sum():,}")
             self.logger.info(f"   Valid in mask: {zero_valid.sum():,}")
 
@@ -236,7 +238,7 @@ class VariableImportanceAnalyzer:
         non_drought_pixels = spi_clean > self.config.spi.threshold
         drought_pixels = spi_clean <= self.config.spi.threshold
 
-        self.logger.info(f"\n📊 SPI Distribution:")
+        self.logger.info("\n📊 SPI Distribution:")
         self.logger.info(f"   Total valid pixels: {len(spi_clean):,}")
         self.logger.info(
             f"   Non-drought (SPI > {self.config.spi.threshold}): "
@@ -610,7 +612,7 @@ class VariableImportanceAnalyzer:
             print(f"  {color}{label:<15}: {weight:.2f}{Colors.RESET}")
 
         print("\n💡 RECOMMENDATION:")
-        print(f"  Use AUTOENCODER weights in experiment_config.py")
+        print("  Use AUTOENCODER weights in experiment_config.py")
 
         print("\n📝 To update autoencoder variable_weights:")
         print("variable_weights: List[float] = field(default_factory=lambda: [")

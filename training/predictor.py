@@ -1,18 +1,20 @@
 """predictor.py - Predictor trainer."""
 
-import torch
-import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Tuple
+
+import numpy as np
+import torch
+
+from evaluation.metrics import find_best_threshold
+from utils.logger import Colors, Logger
 
 from .base import BaseTrainer
 from .losses import build_loss
-from utils.logger import Logger, Colors
-from evaluation.metrics import find_best_threshold
 
 
 class PredictorTrainer(BaseTrainer):
-    """Trainer for ConvLSTM Predictor."""
+    """Trainer for the ConvLSTM Predictor."""
 
     def __init__(
         self,
@@ -24,6 +26,7 @@ class PredictorTrainer(BaseTrainer):
         freeze_encoder_first_epoch: bool = False,
         optimization_metric: str = None,
         calibrate: bool = None,
+        load_attention: bool = True,
     ):
         super().__init__(model, train_dataset, val_dataset, config, save_path)
 
@@ -32,6 +35,12 @@ class PredictorTrainer(BaseTrainer):
         self.freeze_encoder_first_epoch = freeze_encoder_first_epoch
         self.freeze_encoder_epochs = getattr(config.training, 'freeze_encoder_epochs', 5)
         self.encoder_lr_factor = getattr(config.training, 'encoder_lr_factor', 0.1)
+        # Whether the attention module (not just the encoder) was actually
+        # transferred from the pretrained autoencoder. Only meaningful when
+        # freeze_encoder_first_epoch=True; used by _create_optimizer to
+        # decide whether attention gets the gentle encoder LR (it holds
+        # pretrained weights) or the full decoder LR (it's random).
+        self.load_attention = load_attention
 
         self.optimization_metric = (
             optimization_metric or config.optimization.primary_metric
@@ -64,16 +73,16 @@ class PredictorTrainer(BaseTrainer):
             self.loss_mask = torch.from_numpy(train_dataset.valid_mask.astype(np.float32))
             self.loss_mask = self.loss_mask.to(self.device).unsqueeze(0).unsqueeze(0)
 
-        # ✅ CRIAR OPTIMIZER UMA VEZ (não recriar depois)
         self.optimizer = self._create_optimizer()
 
-        self.logger.info(f"📊 PredictorTrainer initialized:")
+        self.logger.info("📊 PredictorTrainer initialized:")
         self.logger.info(f"   Optimization metric: {self.optimization_metric.upper()}")
         self.logger.info(f"   Calibrate: {self.calibrate}")
         self.logger.info(f"   Freeze epochs: {self.freeze_encoder_epochs if self.freeze_encoder_first_epoch else 0}")
         self.logger.info(f"   Encoder LR factor: {self.encoder_lr_factor}")
 
     def _compute_pos_weight(self) -> float:
+        """Estimate the positive-class weight and prevalence from a sample of the training set."""
         total = 0
         positives = 0
 
@@ -110,12 +119,17 @@ class PredictorTrainer(BaseTrainer):
 
     def _create_optimizer(self):
         """
-        Cria otimizador com LRs diferenciados para encoder/attention e decoder.
-        
-        ✅ Mantém LRs diferenciados durante TODO o treinamento.
-        ✅ Atenção usa LR do decoder (não é transferida)
+        Create the optimizer with differentiated learning rates for the
+        encoder/attention and decoder parameter groups.
+
+        The per-group learning rates are kept constant for the entire
+        training run. The attention module gets the gentle encoder LR
+        when it was actually transferred from the autoencoder
+        (self.load_attention=True), since it then holds pretrained
+        weights just like the encoder; otherwise it's randomly
+        initialized and gets the full decoder LR like the rest of the
+        untrained head.
         """
-        # Se não for TL, usar LR único para todos
         if not self.freeze_encoder_first_epoch:
             return torch.optim.Adam(
                 self.model.parameters(),
@@ -123,7 +137,6 @@ class PredictorTrainer(BaseTrainer):
                 weight_decay=self.config.training.weight_decay,
             )
 
-        # Separar parâmetros por grupo
         encoder_params = []
         attention_params = []
         decoder_params = []
@@ -148,12 +161,13 @@ class PredictorTrainer(BaseTrainer):
                 'name': 'encoder'
             })
 
-        # ✅ Atenção: NÃO é transferida, usa LR do decoder
         if attention_params:
+            attention_lr = encoder_lr if self.load_attention else decoder_lr
+            attention_label = 'attention (transferred)' if self.load_attention else 'attention (random)'
             param_groups.append({
                 'params': attention_params,
-                'lr': decoder_lr,  # ← Atenção usa LR do decoder!
-                'name': 'attention (random)'
+                'lr': attention_lr,
+                'name': attention_label
             })
 
         if decoder_params:
@@ -163,7 +177,7 @@ class PredictorTrainer(BaseTrainer):
                 'name': 'decoder'
             })
 
-        self.logger.info(f"   Optimizer groups:")
+        self.logger.info("   Optimizer groups:")
         for group in param_groups:
             self.logger.info(f"      {group['name']}: LR={group['lr']:.2e}")
 
@@ -173,6 +187,7 @@ class PredictorTrainer(BaseTrainer):
         )
 
     def train_epoch(self, train_loader):
+        """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         n_samples = 0
@@ -186,7 +201,8 @@ class PredictorTrainer(BaseTrainer):
                 mask = mask.to(self.device).unsqueeze(1)
 
             self.optimizer.zero_grad(set_to_none=True)
-            logits, _ = self.model(x)
+            attn_mask = mask if mask is not None else self.loss_mask
+            logits, _ = self.model(x, mask=attn_mask)
 
             loss_raw = self.criterion(logits, y_bin)
 
@@ -212,6 +228,7 @@ class PredictorTrainer(BaseTrainer):
         return total_loss / n_samples if n_samples > 0 else float('inf')
 
     def _collect_predictions(self, dataloader) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect probabilities and targets over valid pixels only."""
         self.model.eval()
         all_probs = []
         all_targets = []
@@ -223,10 +240,14 @@ class PredictorTrainer(BaseTrainer):
                 y_bin = batch["y_bin"].to(self.device).float().unsqueeze(1)
 
                 mask = batch.get("mask", None)
+                attn_mask = None
                 if mask is not None:
                     all_masks.append(mask.cpu().numpy().flatten())
+                    attn_mask = mask.to(self.device)
+                else:
+                    attn_mask = self.loss_mask
 
-                logits, _ = self.model(x)
+                logits, _ = self.model(x, mask=attn_mask)
                 probs = torch.sigmoid(logits).cpu().numpy().flatten()
 
                 all_probs.extend(probs)
@@ -248,6 +269,7 @@ class PredictorTrainer(BaseTrainer):
         return probs, targets
 
     def fit_calibrator(self, train_loader, val_loader) -> None:
+        """Fit a probability calibrator on pooled train + validation predictions."""
         from evaluation.calibration import PlattCalibrator, IsotonicCalibrator
 
         calibrator_type = getattr(self.config.training, 'calibrator_type', 'platt')
@@ -276,7 +298,7 @@ class PredictorTrainer(BaseTrainer):
         self.calibrator.fit(probs, targets)
 
         probs_calibrated = self.calibrator.transform(probs)
-        self.logger.info(f"  📊 Calibration results:")
+        self.logger.info("  📊 Calibration results:")
         self.logger.info(f"     Mean prob (raw): {probs.mean():.4f}")
         self.logger.info(f"     Mean prob (calibrated): {probs_calibrated.mean():.4f}")
         self.logger.info(f"     Positive rate: {targets.mean():.4f}")
@@ -290,6 +312,7 @@ class PredictorTrainer(BaseTrainer):
             self.logger.warning(f"  ⚠️ Could not save calibrator: {e}")
 
     def calibrate_probs(self, probs: np.ndarray) -> np.ndarray:
+        """Apply the fitted calibrator to raw probabilities."""
         if self.calibrator is None:
             return probs
 
@@ -308,6 +331,7 @@ class PredictorTrainer(BaseTrainer):
         return calibrated.reshape(original_shape)
 
     def validate(self, val_loader, use_calibration: bool = True):
+        """Validate the model and find the best decision threshold."""
         probs, targets = self._collect_predictions(val_loader)
 
         if len(probs) == 0:
@@ -348,14 +372,17 @@ class PredictorTrainer(BaseTrainer):
         }
 
     def train(self):
-        self.logger.header("TREINAMENTO DO PREDICTOR")
-        self.logger.info(f"Métrica de otimização: {self.optimization_metric.upper()}")
+        """Main training loop."""
+        self.logger.header("PREDICTOR TRAINING")
+        self.logger.info(f"Optimization metric: {self.optimization_metric.upper()}")
 
-        # ✅ Log da estratégia de TL
         if self.freeze_encoder_first_epoch:
-            self.logger.info(f"🔹 Estratégia: TL somente Encoder (Attention aleatória)")
+            if self.load_attention:
+                self.logger.info("🔹 Strategy: transfer learning (encoder + attention transferred)")
+            else:
+                self.logger.info("🔹 Strategy: transfer learning (encoder only, random attention)")
         else:
-            self.logger.info(f"🔹 Estratégia: Scratch (tudo aleatório)")
+            self.logger.info("🔹 Strategy: scratch (fully random initialization)")
 
         train_loader, val_loader = self.create_dataloaders(shuffle_train=True)
 
@@ -365,15 +392,17 @@ class PredictorTrainer(BaseTrainer):
 
         if self.freeze_encoder_first_epoch:
             self.model.freeze_encoder(freeze=True)
-            self.logger.info(f"🔒 Encoder congelado por {self.freeze_encoder_epochs} épocas")
-            self.logger.info(f"   Attention NÃO está congelada (aleatória)")
+            self.logger.info(f"🔒 Encoder frozen for {self.freeze_encoder_epochs} epochs")
+            self.logger.info("   Attention is NOT frozen (random init)")
 
         for epoch in range(self.config.training.epochs):
-            # ✅ Descongelar apenas o encoder (attention já estava livre)
             if self.freeze_encoder_first_epoch and epoch == self.freeze_encoder_epochs:
                 self.model.freeze_encoder(freeze=False)
-                self.logger.info(f"🔓 Encoder descongelado na época {epoch}")
-                self.logger.info(f"   Mantendo LRs: Encoder={self.config.training.learning_rate * self.encoder_lr_factor:.2e}, Decoder={self.config.training.learning_rate:.2e}")
+                self.logger.info(f"🔓 Encoder unfrozen at epoch {epoch}")
+                self.logger.info(
+                    f"   Keeping LRs: Encoder={self.config.training.learning_rate * self.encoder_lr_factor:.2e}, "
+                    f"Decoder={self.config.training.learning_rate:.2e}"
+                )
 
             train_loss = self.train_epoch(train_loader)
 
@@ -406,7 +435,7 @@ class PredictorTrainer(BaseTrainer):
             status = f"{Colors.GREEN}✓{Colors.RESET}" if improved else f"ES {patience_counter}/{self.config.training.patience}"
 
             self.logger.info(
-                f"Época {epoch:3d} | Loss {train_loss:.4f} | "
+                f"Epoch {epoch:3d} | Loss {train_loss:.4f} | "
                 f"{metric_label} {metric_value:.4f} | "
                 f"CSI {epoch_csi:.4f} | MCC {epoch_mcc:.4f} | "
                 f"Thr {val_results['threshold']:.3f} | "
@@ -414,10 +443,10 @@ class PredictorTrainer(BaseTrainer):
             )
 
             if self.freeze_encoder_first_epoch and epoch < self.freeze_encoder_epochs:
-                self.logger.debug(f"   🔒 Encoder congelado (época {epoch+1}/{self.freeze_encoder_epochs})")
+                self.logger.debug(f"   🔒 Encoder frozen (epoch {epoch + 1}/{self.freeze_encoder_epochs})")
 
             if epoch >= min_epochs and patience_counter >= self.config.training.patience:
-                self.logger.warning(f"Early stopping na época {epoch}")
+                self.logger.warning(f"Early stopping at epoch {epoch}")
                 break
 
         checkpoint = torch.load(self.save_path, map_location=self.device, weights_only=False)
@@ -452,6 +481,6 @@ class PredictorTrainer(BaseTrainer):
             self.logger.success(f"✅ Uncalibrated - CSI: {final_val['csi']:.4f} | MCC: {final_val['mcc']:.4f}")
 
         torch.save(checkpoint, self.save_path)
-        self.logger.success(f"✅ Final checkpoint saved")
+        self.logger.success("✅ Final checkpoint saved")
 
         return best_score

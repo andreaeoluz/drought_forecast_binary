@@ -1,4 +1,4 @@
-"""reproducibility.py - Configuração de reprodutibilidade"""
+"""reproducibility.py - Reproducibility configuration."""
 
 import random
 import numpy as np
@@ -8,55 +8,45 @@ import os
 
 def set_reproducible_seeds(seed: int = 42, deterministic: bool = True):
     """
-    Configura todas as sementes para reprodutibilidade.
-    
+    Set all random seeds for reproducibility.
+
     Args:
-        seed: Semente base
-        deterministic: Se True, força operações determinísticas
+        seed: Base random seed.
+        deterministic: If True, force deterministic PyTorch operations.
     """
-    # Python
     random.seed(seed)
-    
-    # NumPy
     np.random.seed(seed)
-    
-    # PyTorch
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
-    # PyTorch determinístico
+
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # Importante: algumas operações podem ficar mais lentas
+        # Some deterministic CUDA operations require this workspace config.
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    
-    # Python hash
+
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    #print(f"✅ Reprodutibilidade configurada (seed={seed}, deterministic={deterministic})")
 
 
 def get_deterministic_loader(loader, seed: int = 42):
     """
-    Garante que um DataLoader seja determinístico.
-    
+    Rebuild a DataLoader with a seeded worker_init_fn for reproducibility.
+
     Args:
-        loader: DataLoader existente
-        seed: Semente para o worker
-    
+        loader: Existing DataLoader.
+        seed: Base seed for worker initialization.
+
     Returns:
-        DataLoader com worker_init_fn configurado
+        A new DataLoader with worker_init_fn configured.
     """
     def worker_init_fn(worker_id):
-        """Inicializa cada worker com semente base + worker_id."""
         worker_seed = seed + worker_id
         np.random.seed(worker_seed)
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
-    
-    # Recriar DataLoader com worker_init_fn
+
     return torch.utils.data.DataLoader(
         loader.dataset,
         batch_size=loader.batch_size,
@@ -66,5 +56,5 @@ def get_deterministic_loader(loader, seed: int = 42):
         pin_memory=loader.pin_memory,
         drop_last=loader.drop_last if hasattr(loader, 'drop_last') else False,
         worker_init_fn=worker_init_fn,
-        generator=torch.Generator().manual_seed(seed),  # Para shuffle
+        generator=torch.Generator().manual_seed(seed),
     )

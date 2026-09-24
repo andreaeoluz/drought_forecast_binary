@@ -27,10 +27,10 @@ class ExtremeDroughtAugmenter:
         Initialize augmenter.
 
         Args:
-            severity_factor: How much to intensify drought (0.1-0.5)
-            expansion_factor: How much to expand drought area (0-0.3)
-            prob: Probability of applying augmentation (0-1)
-            seed: Random seed for reproducibility
+            severity_factor: How much to intensify drought (0.1-0.5).
+            expansion_factor: How much to expand drought area (0-0.3).
+            prob: Probability of applying augmentation (0-1).
+            seed: Random seed for reproducibility.
         """
         self.severity_factor = severity_factor
         self.expansion_factor = expansion_factor
@@ -48,20 +48,19 @@ class ExtremeDroughtAugmenter:
         Apply augmentation to create more extreme drought.
 
         Args:
-            x: Input data (T, C, H, W) or (T, H, W)
-            y: Binary mask (H, W) - 1 for drought, 0 for non-drought
-            mask: Validity mask (H, W) - optional
+            x: Input data (T, C, H, W) or (T, H, W).
+            y: Binary mask (H, W) - 1 for drought, 0 for non-drought.
+            mask: Validity mask (H, W) - optional.
 
         Returns:
-            Augmented x, y, mask
+            Augmented x, y, mask.
         """
         self._applied = False
 
-        # Skip if no drought or probability not met
+        # Skip if no drought or probability not met.
         if y.sum() == 0 or self._rng.random() > self.prob:
             return x, y, mask
 
-        # Determine data shape
         if x.ndim == 4:  # (T, C, H, W)
             return self._augment_4d(x, y, mask)
         else:  # (T, H, W) or (H, W)
@@ -78,13 +77,30 @@ class ExtremeDroughtAugmenter:
         aug_x = x.copy()
         aug_y = y.copy()
 
-        # Find drought pixels
         drought_pixels = aug_y > 0.5
 
         if not drought_pixels.any():
             return aug_x, aug_y, mask
 
-        # 1. INTENSIFY DROUGHT SIGNALS
+        # Area expansion is applied before intensification, so that any
+        # newly-added drought pixels get their input signal intensified
+        # too (rather than only carrying the "drought" label with
+        # unmodified input values).
+
+        # 1. Optionally expand the drought area via dilation.
+        if self.expansion_factor > 0 and self._rng.random() < 0.3:
+            try:
+                from scipy.ndimage import binary_dilation
+                kernel_size = max(1, int(self.expansion_factor * min(H, W) / 10))
+                if kernel_size > 0:
+                    kernel = np.ones((kernel_size, kernel_size))
+                    expanded = binary_dilation(drought_pixels, structure=kernel, iterations=1)
+                    aug_y = expanded.astype(np.float32)
+                    drought_pixels = expanded
+            except ImportError:
+                pass
+
+        # 2. Intensify drought signals over the (possibly expanded) mask.
         for c in range(C):
             if c in [0, 2, 6]:  # pr, soil, tavg
                 if c == 0:  # Precipitation: make it lower
@@ -94,27 +110,8 @@ class ExtremeDroughtAugmenter:
                 elif c == 2:  # Soil moisture: make it lower
                     aug_x[:, c, drought_pixels] *= (1 - self.severity_factor * 0.7)
 
-        # 2. EXPAND DROUGHT AREA (optional)
-        if self.expansion_factor > 0 and self._rng.random() < 0.3:
-            try:
-                from scipy.ndimage import binary_dilation
-                kernel_size = max(1, int(self.expansion_factor * min(H, W) / 10))
-                if kernel_size > 0:
-                    kernel = np.ones((kernel_size, kernel_size))
-                    expanded = binary_dilation(drought_pixels, structure=kernel, iterations=1)
-                    aug_y = expanded.astype(np.float32)
-            except ImportError:
-                pass
-
-        # ✅ CORREÇÃO: Verificar se mask é numpy array e se não é None
         if mask is not None:
-            # Converter para numpy se for tensor
-            if hasattr(mask, 'numpy'):
-                mask_np = mask.numpy()
-            else:
-                mask_np = mask
-            
-            # Aplicar máscara: apenas pixels válidos
+            mask_np = mask.numpy() if hasattr(mask, 'numpy') else mask
             aug_y[~mask_np.astype(bool)] = 0
 
         self._applied = True
@@ -143,12 +140,8 @@ class ExtremeDroughtAugmenter:
             except ImportError:
                 pass
 
-        # ✅ CORREÇÃO: Verificar se mask é numpy array e se não é None
         if mask is not None:
-            if hasattr(mask, 'numpy'):
-                mask_np = mask.numpy()
-            else:
-                mask_np = mask
+            mask_np = mask.numpy() if hasattr(mask, 'numpy') else mask
             aug_y[~mask_np.astype(bool)] = 0
 
         self._applied = True
@@ -191,14 +184,14 @@ def get_augmenter(
     Factory function to get an augmenter.
 
     Args:
-        augment_type: 'none' or 'extreme'
-        severity_factor: How much to intensify drought
-        expansion_factor: How much to expand drought area
-        prob: Probability of applying augmentation
-        seed: Random seed
+        augment_type: 'none' or 'extreme'.
+        severity_factor: How much to intensify drought.
+        expansion_factor: How much to expand the drought area.
+        prob: Probability of applying augmentation.
+        seed: Random seed.
 
     Returns:
-        Augmenter instance
+        Augmenter instance.
     """
     if augment_type == "none":
         return NoAugmenter()

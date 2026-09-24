@@ -1,8 +1,9 @@
 """losses.py - Loss functions for classification and reconstruction."""
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any
 
 
 class FocalLoss(nn.Module):
@@ -171,14 +172,24 @@ class WeightedBCEWithLogitsLoss(nn.Module):
         weight = self.pos_weight * targets + self.neg_weight * (1 - targets)
         loss = loss * weight
 
-        # Apply mask if provided
+        # Apply mask if provided (elementwise; zeroes out invalid pixels)
         if mask is not None:
             loss = loss * mask
+
+        # reduction='none' -> caller is responsible for any further masking
+        # and reduction (e.g. `(loss * mask).sum() / mask.sum()`), so we must
+        # NOT collapse to a scalar here, or the external mask becomes a no-op.
+        if self.reduction == 'none':
+            return loss
+
+        if mask is not None:
             valid_pixels = mask.sum()
             if valid_pixels > 0:
                 loss = loss.sum() / valid_pixels
             else:
                 loss = loss.mean()
+        elif self.reduction == 'sum':
+            loss = loss.sum()
         else:
             loss = loss.mean()
 
@@ -193,6 +204,7 @@ def build_loss(
     prevalence: Optional[float] = None,
     use_dynamic_alpha: bool = True,
     variable_weights: Optional[torch.Tensor] = None,
+    reduction: str = 'mean',
 ) -> torch.nn.Module:
     """
     Build loss function with dynamic alpha support.
@@ -205,6 +217,12 @@ def build_loss(
         prevalence: Prevalence of positive class (for dynamic alpha)
         use_dynamic_alpha: If True, calculate alpha = 1 - 2*prevalence
         variable_weights: Variable weights for Smooth L1 Loss
+        reduction: 'mean', 'sum', or 'none'. Use 'none' whenever the caller
+            applies a validity mask *after* calling the loss (e.g. training
+            loops that do `(loss * mask).sum() / mask.sum()`), otherwise the
+            internal mean would already collapse invalid/masked pixels into
+            the result before the external masking has any chance to act,
+            silently defeating the mask.
 
     Returns:
         Loss module
@@ -225,12 +243,14 @@ def build_loss(
             alpha=alpha,
             gamma=gamma,
             pos_weight=pos_weight,
+            reduction=reduction,
         )
 
     elif loss_name == "weighted_bce":
         return WeightedBCEWithLogitsLoss(
             pos_weight=pos_weight,
             neg_weight=1.0,
+            reduction=reduction,
         )
 
     elif loss_name == "smooth_l1":
@@ -239,6 +259,7 @@ def build_loss(
         return WeightedSmoothL1Loss(
             variable_weights=variable_weights,
             beta=0.1,
+            reduction=reduction,
         )
 
     else:

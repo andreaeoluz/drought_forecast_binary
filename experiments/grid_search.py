@@ -9,10 +9,10 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from config import ExperimentConfig, get_paths
-from data import load_region_timeseries, ClimateNormalizer, ClimateDataset, load_spi_cache
-from data.augmentation import get_augmenter
+from data import load_region_timeseries, ClimateNormalizer, ClimateDataset, load_spi_cache, get_augmenter
 from models import ConvLSTMPredictor
 from training import PredictorTrainer
+from training.rolling_origin import run_rolling_origin_evaluation, RollingSplit
 from utils import set_reproducible_seeds
 from utils.logger import Logger, Colors
 
@@ -21,8 +21,8 @@ class GridSearch:
     """
     Grid search for hyperparameter optimization.
 
-    Performs systematic search over p (history length) and q (forecast horizon)
-    values, evaluating models using the specified optimization metric.
+    Performs a systematic search over p (history length) and q (forecast
+    horizon), evaluating models using the specified optimization metric.
     """
 
     def __init__(
@@ -30,6 +30,7 @@ class GridSearch:
         config: ExperimentConfig,
         base_data_path: Path,
         optimization_metric: str = None,
+        load_attention: bool = True,
     ):
         self.config = config
         self.base_data_path = base_data_path
@@ -37,12 +38,21 @@ class GridSearch:
         self.use_transfer_learning = config.use_transfer_learning
         self.logger = Logger()
 
+        # Ablation knob: when True (default, unchanged behavior), the
+        # DualTemporalAttention weights are transferred from the autoencoder
+        # along with the encoder. When False, only the encoder is transferred
+        # and attention starts randomly initialized, matching what the
+        # training log has always claimed ("random attention").
+        self.load_attention = load_attention
+
         self.optimization_metric = (
             optimization_metric or config.optimization.primary_metric
         )
         self.secondary_metric = config.optimization.secondary_metric
 
         self.suffix = f"thr_{abs(self.threshold):.1f}_tl_{self.use_transfer_learning}"
+        if self.use_transfer_learning and not self.load_attention:
+            self.suffix += "_noattn"
         self.paths = get_paths(config.region, threshold=self.threshold)
 
         self.results_dir = self.paths["grid_search_results"] / self.suffix
@@ -94,7 +104,7 @@ class GridSearch:
     # =========================================================================
 
     def load_data(self) -> Dict[str, Any]:
-        """Load and preprocess data for grid search."""
+        """Load and preprocess data for the grid search."""
         self._print_section("📂 LOADING DATA")
 
         out = load_region_timeseries(self.base_data_path, self.config)
@@ -129,21 +139,47 @@ class GridSearch:
         print(f"  {Colors.GREEN}Training{Colors.RESET}    : {len(data_train):>4} months  ({train_period})")
         print(f"  {Colors.CYAN}Validation{Colors.RESET}  : {len(data_val):>4} months  ({val_period})")
 
-        # Normalize data
-        normalizer = ClimateNormalizer(self.config.data.bands)
-        data_train_norm = normalizer.fit_transform(data_train, months_train, valid_mask)
+        # ================================================================
+        # NORMALIZER
+        # ================================================================
+        # When transferring the encoder, it MUST see data normalized the
+        # exact same way it was pretrained on - reuse the autoencoder's own
+        # normalizer instead of fitting a new one. Fitting fresh here (as
+        # this used to do unconditionally, for both TL and scratch runs)
+        # silently overwrote autoencoder_dir/normalizer.json with stats
+        # computed on this grid search's own (differently-bounded) train
+        # split, corrupting the exact normalizer the encoder was pretrained
+        # with for every later consumer of that file: evaluate_autoencoder.py,
+        # inference, and any subsequent grid search run (TL or scratch)
+        # that happened to run after this one.
+        autoencoder_normalizer_path = self.paths["autoencoder_dir"] / "normalizer.json"
+
+        if self.use_transfer_learning and autoencoder_normalizer_path.exists():
+            normalizer = ClimateNormalizer.load(autoencoder_normalizer_path)
+            print(f"  ✅ Reusing pretrained autoencoder's normalizer "
+                  f"(required for a correct transfer): {autoencoder_normalizer_path}")
+            backup_path = self.paths["grid_search_dir"] / "normalizer_pretrained.json"
+        else:
+            if self.use_transfer_learning:
+                self.logger.warning(
+                    f"  ⚠️  Transfer learning requested but no autoencoder normalizer "
+                    f"found at {autoencoder_normalizer_path} - fitting a fresh one; "
+                    f"the encoder's input distribution will not exactly match pretraining."
+                )
+            normalizer = ClimateNormalizer(self.config.data.bands)
+            normalizer.fit(data_train, months_train, valid_mask)
+            print("  ✅ Normalizer fit fresh for this scratch run "
+                  f"(NOT written to {autoencoder_normalizer_path} - that file belongs "
+                  "to the autoencoder)")
+            backup_path = self.paths["grid_search_dir"] / "normalizer_scratch.json"
+
+        data_train_norm = normalizer.transform(data_train, months_train, valid_mask)
         data_val_norm = normalizer.transform(data_val, months_val, valid_mask)
 
-        # Save normalizer
-        normalizer_path = self.paths["autoencoder_dir"] / "normalizer.json"
-        normalizer_path.parent.mkdir(parents=True, exist_ok=True)
-        normalizer.save(normalizer_path)
-        print(f"  ✅ Normalizer saved to: {normalizer_path}")
-
-        backup_path = self.paths["grid_search_dir"] / "normalizer.json"
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
         normalizer.save(backup_path)
+        print(f"  📄 Normalizer copy saved to: {backup_path}")
 
-        # Load SPI
         spi, _ = load_spi_cache(self.config.spi.scale, self.paths["spi_cache_dir"])
         spi_train = spi[train_mask] if spi is not None else None
         spi_val = spi[val_mask] if spi is not None else None
@@ -168,7 +204,7 @@ class GridSearch:
         valid_pixels = valid_mask.sum()
         invalid_pixels = total_pixels - valid_pixels
 
-        print(f"\n  📊 Validity Mask:")
+        print("\n  📊 Validity Mask:")
         print(f"     Total pixels: {total_pixels:,}")
         print(f"     Valid: {valid_pixels:,} ({valid_pixels/total_pixels:.1%})")
         print(f"     Invalid: {invalid_pixels:,} ({invalid_pixels/total_pixels:.1%})")
@@ -177,7 +213,7 @@ class GridSearch:
             zero_pixels = (data[0] == 0).all(axis=-1)
             zero_valid = zero_pixels & valid_mask
 
-            print(f"\n  📊 Zero-value (non-drought) pixels:")
+            print("\n  📊 Zero-value (non-drought) pixels:")
             print(f"     Total: {zero_pixels.sum():,}")
             print(f"     Valid in mask: {zero_valid.sum():,}")
 
@@ -194,7 +230,7 @@ class GridSearch:
                 print(f"\n  ℹ️  NaN/Inf pixels marked as invalid: {nan_invalid.sum():,}")
 
     def load_autoencoder(self) -> Optional[Dict[str, Any]]:
-        """Load pretrained autoencoder checkpoint for transfer learning."""
+        """Load the pretrained autoencoder checkpoint for transfer learning."""
         autoencoder_path = self.paths["autoencoder_dir"] / "model.pth"
         if not autoencoder_path.exists():
             return None
@@ -205,7 +241,6 @@ class GridSearch:
             weights_only=False
         )
 
-        # Add metadata about anomalies
         if hasattr(self.config.autoencoder, 'use_anomalies'):
             checkpoint["use_anomalies"] = self.config.autoencoder.use_anomalies
 
@@ -216,7 +251,7 @@ class GridSearch:
     # =========================================================================
 
     def _create_augmenter(self) -> Optional[object]:
-        """Create data augmenter if enabled."""
+        """Create the data augmenter, if enabled."""
         if not self.config.augmentation.enabled:
             return None
 
@@ -229,7 +264,7 @@ class GridSearch:
         )
 
         aug_info = augmenter.get_info() if hasattr(augmenter, 'get_info') else {}
-        self.logger.info(f"  🔄 Augmentation enabled:")
+        self.logger.info("  🔄 Augmentation enabled:")
         self.logger.info(f"     Type: {self.config.augmentation.augment_type}")
         self.logger.info(f"     Severity factor: {aug_info.get('severity_factor', 0.3)}")
         self.logger.info(f"     Expansion factor: {aug_info.get('expansion_factor', 0.2)}")
@@ -247,18 +282,14 @@ class GridSearch:
 
         self._print_header("🔍 GRID SEARCH")
 
-        # Display experiment configuration
         self._display_experiment_config()
 
-        # Load data
         data_dict = self.load_data()
         augmenter = self._create_augmenter()
 
-        # Load autoencoder for transfer learning
         ae_checkpoint = self.load_autoencoder() if self.use_transfer_learning else None
         self._display_transfer_learning_status(ae_checkpoint)
 
-        # Run grid search
         total_combinations = len(self.config.p_values) * len(self.config.q_values)
         current = 0
 
@@ -270,43 +301,161 @@ class GridSearch:
             for q in self.config.q_values:
                 current += 1
 
-                # Validate data sufficiency
                 if not self._validate_data_sufficiency(p, q, data_dict):
                     continue
 
                 self._print_progress(current, total_combinations, p, q)
 
-                # Create datasets
                 train_ds, val_ds = self._create_datasets(p, q, data_dict, augmenter)
 
                 if len(train_ds) == 0 or len(val_ds) == 0:
                     print("  ⚠️  Dataset empty! Skipping...")
                     continue
 
-                # Create and train model
                 result = self._train_and_evaluate(p, q, train_ds, val_ds, ae_checkpoint)
 
                 if result is not None:
                     self.results.append(result)
 
-                # Cleanup
                 del train_ds, val_ds
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        # Save results
         self.save_results()
+
+        if self.config.rolling_origin.enabled and self.results:
+            best = max(self.results, key=lambda r: r.get(f"best_{self.optimization_metric}", -1.0))
+            self.run_rolling_origin(best["p"], best["q"], ae_checkpoint)
 
         elapsed = datetime.now() - self.start_time
         elapsed_str = str(elapsed).split('.')[0]
         self._print_header(f"✅ GRID SEARCH COMPLETED  ⏱  {elapsed_str}")
 
     # =========================================================================
+    # ROLLING-ORIGIN (MULTI-SPLIT) EVALUATION
+    #
+    # Improvement doc, items 5-6: re-evaluate the winning (p, q) combination
+    # over several chronologically-advancing splits, instead of trusting a
+    # single Train/Validation split whose validation period (2020-2022)
+    # does not necessarily represent the severity seen at test time. This
+    # both exposes how stable the configuration is across climate regimes
+    # (normal / moderate / severe drought) and gives an aggregated,
+    # regime-robust metric alongside the single-split one already produced
+    # by the standard grid search above.
+    # =========================================================================
+
+    def run_rolling_origin(
+        self,
+        p: int,
+        q: int,
+        ae_checkpoint: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run rolling-origin evaluation for a single (p, q) combination
+        (typically the winner of the standard grid search).
+
+        Returns the same structure as
+        `training.rolling_origin.run_rolling_origin_evaluation`: a dict
+        with "splits" (per-split period + metrics) and "aggregated"
+        (mean/std/min/max/worst_split per metric).
+        """
+        self._print_header(f"🔄 ROLLING-ORIGIN EVALUATION (p={p}, q={q})")
+
+        out = load_region_timeseries(self.base_data_path, self.config)
+        years, months, data, valid_mask = out["years"], out["months"], out["data"], out["valid_mask"]
+
+        spi, _ = load_spi_cache(self.config.spi.scale, self.paths["spi_cache_dir"])
+
+        autoencoder_normalizer_path = self.paths["autoencoder_dir"] / "normalizer.json"
+        reuse_pretrained_normalizer = (
+            self.use_transfer_learning and autoencoder_normalizer_path.exists()
+        )
+
+        def _train_eval(split: RollingSplit) -> Dict[str, float]:
+            data_train = data[split.train_mask]
+            data_val = data[split.val_mask]
+            months_train = months[split.train_mask]
+            months_val = months[split.val_mask]
+            spi_train = spi[split.train_mask] if spi is not None else None
+            spi_val = spi[split.val_mask] if spi is not None else None
+
+            if reuse_pretrained_normalizer:
+                normalizer = ClimateNormalizer.load(autoencoder_normalizer_path)
+            else:
+                normalizer = ClimateNormalizer(self.config.data.bands)
+                normalizer.fit(data_train, months_train, valid_mask)
+
+            data_train_norm = np.nan_to_num(
+                normalizer.transform(data_train, months_train, valid_mask), nan=0.0
+            )
+            data_val_norm = np.nan_to_num(
+                normalizer.transform(data_val, months_val, valid_mask), nan=0.0
+            )
+
+            train_ds = ClimateDataset(
+                data=data_train_norm, spi=spi_train, months=months_train,
+                p=p, q=q, spi_threshold=self.config.spi.threshold,
+                valid_mask=valid_mask,
+                use_weighted_sampling=self.config.imbalance.use_weighted_sampling,
+                temporal_decay=True, mode="classification", augmenter=None,
+                seed=self.config.random_seed, min_valid_ratio=self.config.data.min_valid_ratio,
+            )
+            val_ds = ClimateDataset(
+                data=data_val_norm, spi=spi_val, months=months_val,
+                p=p, q=q, spi_threshold=self.config.spi.threshold,
+                valid_mask=valid_mask, use_weighted_sampling=False,
+                temporal_decay=True, mode="classification", augmenter=None,
+                seed=self.config.random_seed, min_valid_ratio=self.config.data.min_valid_ratio,
+            )
+
+            if len(train_ds) == 0 or len(val_ds) == 0:
+                self.logger.warning(f"   ⚠️ {split.label}: empty dataset, skipping")
+                return {"csi": 0.0, "mcc": 0.0}
+
+            model = ConvLSTMPredictor(self.config.get_model_config("predictor")).to(self.config.device)
+            if ae_checkpoint is not None:
+                try:
+                    model.load_encoder_from_autoencoder(ae_checkpoint, load_attention=self.load_attention)
+                except Exception as e:
+                    self.logger.warning(f"   ⚠️ {split.label}: transfer failed ({e}), using scratch init")
+
+            save_path = self.paths["grid_search_dir"] / "rolling_origin" / f"model_p{p}_q{q}_{split.label}.pth"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+
+            trainer = PredictorTrainer(
+                model, train_ds, val_ds, self.config, save_path,
+                freeze_encoder_first_epoch=bool(ae_checkpoint),
+                optimization_metric=self.optimization_metric,
+                calibrate=self.config.training.calibrate,
+                load_attention=self.load_attention,
+            )
+
+            try:
+                trainer.train()
+                ckpt = torch.load(save_path, map_location=self.config.device, weights_only=False)
+            except Exception as e:
+                self.logger.warning(f"   ⚠️ {split.label}: training error ({e})")
+                return {"csi": 0.0, "mcc": 0.0}
+            finally:
+                del model, trainer
+
+            return {"csi": ckpt.get("best_csi", 0.0), "mcc": ckpt.get("best_mcc", 0.0)}
+
+        result = run_rolling_origin_evaluation(years, months, _train_eval, self.config, logger=self.logger)
+
+        output_path = self.results_dir / f"rolling_origin_p{p}_q{q}_{self.suffix}.json"
+        with open(output_path, "w") as f:
+            json.dump(result, f, indent=2, default=float)
+        self.logger.success(f"✅ Rolling-origin results saved to: {output_path}")
+
+        return result
+
+    # =========================================================================
     # HELPER METHODS FOR RUN
     # =========================================================================
 
     def _display_experiment_config(self) -> None:
-        """Display experiment configuration."""
+        """Display the experiment configuration."""
         ds_info = self.config.get_downsample_info(self.config.region)
         ds_h, ds_w = self.config.get_downsample(self.config.region)
 
@@ -324,15 +473,18 @@ class GridSearch:
         print(f"{'─' * 68}")
 
     def _display_transfer_learning_status(self, ae_checkpoint: Optional[Dict]) -> None:
-        """Display transfer learning status."""
+        """Display the transfer learning status."""
         if ae_checkpoint:
             print("\n  🧠 Using autoencoder for transfer learning")
-            print("  📌 Apenas o encoder será transferido (attention aleatória)")
+            if self.load_attention:
+                print("  📌 Encoder AND attention will be transferred")
+            else:
+                print("  📌 Only the encoder will be transferred (random attention)")
         else:
             print("\n  🔧 Training models from scratch")
 
     def _validate_data_sufficiency(self, p: int, q: int, data_dict: Dict) -> bool:
-        """Validate if there is enough data for the given p and q."""
+        """Validate whether there is enough data for the given p and q."""
         max_samples = len(data_dict["data_val"])
         min_required = p + q
 
@@ -354,7 +506,7 @@ class GridSearch:
         data_dict: Dict,
         augmenter: Optional[object]
     ) -> tuple:
-        """Create training and validation datasets."""
+        """Create the training and validation datasets."""
         train_ds = ClimateDataset(
             data=data_dict["data_train"],
             spi=data_dict["spi_train"],
@@ -367,6 +519,7 @@ class GridSearch:
             mode="classification",
             augmenter=augmenter,
             seed=self.config.random_seed,
+            min_valid_ratio=self.config.data.min_valid_ratio,
         )
 
         val_ds = ClimateDataset(
@@ -381,6 +534,7 @@ class GridSearch:
             mode="classification",
             augmenter=None,
             seed=self.config.random_seed,
+            min_valid_ratio=self.config.data.min_valid_ratio,
         )
 
         print(f"  📊 Training samples: {len(train_ds):>4}")
@@ -400,8 +554,7 @@ class GridSearch:
         val_ds: ClimateDataset,
         ae_checkpoint: Optional[Dict]
     ) -> Optional[Dict]:
-        """Train and evaluate a model for given parameters."""
-        # Create model
+        """Train and evaluate a model for the given (p, q) combination."""
         model = ConvLSTMPredictor(
             self.config.get_model_config("predictor")
         ).to(self.config.device)
@@ -413,25 +566,27 @@ class GridSearch:
             try:
                 model.load_encoder_from_autoencoder(
                     ae_checkpoint,
-                    load_attention=True  
+                    load_attention=self.load_attention
                 )
-                print(f"  🧠 Encoder: transferred ✅")
-                print(f"  🧠 Attention: transferred ✅")
+                print("  🧠 Encoder: transferred ✅")
+                if self.load_attention:
+                    print("  🧠 Attention: transferred ✅")
+                else:
+                    print("  🧠 Attention: kept random (ablation: load_attention=False)")
             except Exception as e:
                 print(f"  ⚠️  Error transferring encoder/attention: {e}")
-                print(f"  🔧 Training from scratch...")
+                print("  🔧 Training from scratch...")
                 ae_checkpoint = None
 
-        # Set save path
+        attn_suffix = "" if self.load_attention else "_noattn"
         model_dir = (
-            self.paths["grid_search_pretrained"]
+            self.paths["grid_search_pretrained"].parent / f"pretrained{attn_suffix}"
             if ae_checkpoint
             else self.paths["grid_search_scratch"]
         )
         save_path = model_dir / f"model_p{p}_q{q}.pth"
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Create trainer
         trainer = PredictorTrainer(
             model,
             train_ds,
@@ -441,29 +596,27 @@ class GridSearch:
             freeze_encoder_first_epoch=bool(ae_checkpoint),
             optimization_metric=self.optimization_metric,
             calibrate=self.config.training.calibrate,
+            load_attention=self.load_attention,
         )
 
-        # Train
         try:
             best_score = trainer.train()
         except Exception as e:
             print(f"  ❌ Training error: {e}")
             return None
 
-        # Load checkpoint
         try:
             ckpt = torch.load(save_path, map_location=self.config.device, weights_only=False)
         except Exception as e:
             print(f"  ⚠️  Error loading checkpoint: {e}")
             ckpt = {}
 
-        # Build result
         result = {
             "region": self.config.region,
             "p": p,
             "q": q,
             "transfer_learning": self.use_transfer_learning,
-            "load_attention": True if ae_checkpoint is not None else False,
+            "load_attention": self.load_attention if ae_checkpoint is not None else False,
             f"best_{self.optimization_metric}": ckpt.get(
                 "best_score", best_score if best_score is not None else 0.0
             ),
@@ -483,7 +636,6 @@ class GridSearch:
             result["final_mcc"] = final_metrics.get("mcc", 0.0)
             result["final_threshold"] = ckpt.get("best_threshold", 0.14)
 
-        # Cleanup
         del model, trainer
 
         return result
@@ -493,7 +645,7 @@ class GridSearch:
     # =========================================================================
 
     def save_results(self) -> None:
-        """Save grid search results to files."""
+        """Save the grid search results to disk."""
         if not self.results:
             print("  ⚠️  No results to save")
             return
@@ -504,7 +656,6 @@ class GridSearch:
         score_col = f"best_{self.optimization_metric}"
         df = df.sort_values(score_col, ascending=False)
 
-        # Save to Excel
         excel_path = self.results_dir / f"grid_search_results_{self.suffix}.xlsx"
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="All Results", index=False)
@@ -528,7 +679,7 @@ class GridSearch:
         self.save_best_configuration()
 
     def save_best_configuration(self) -> None:
-        """Save the best configuration and display results."""
+        """Save the best configuration and display a summary."""
         if not self.results:
             print("  ⚠️  No results to save")
             return
@@ -538,7 +689,6 @@ class GridSearch:
         primary_col = f"best_{self.optimization_metric}"
         secondary_col = f"best_{self.secondary_metric}"
 
-        # Sort by primary and secondary metrics
         if primary_col in df.columns and secondary_col in df.columns:
             df_sorted = df.sort_values([primary_col, secondary_col], ascending=[False, False])
         else:
@@ -570,7 +720,6 @@ class GridSearch:
             "median_score": float(df[primary_col].median()),
         }
 
-        # Save JSON summary
         config_summary = {
             "experiment_info": {
                 "region": self.config.region,
@@ -592,15 +741,12 @@ class GridSearch:
         with open(output_path, "w") as f:
             json.dump(config_summary, f, indent=2)
 
-        # Display results
         self._display_best_configuration(best, primary_col, secondary_col)
         self._display_top5(top5, primary_col, secondary_col)
-
-        # Save summary report
         self._save_summary_report(best, top5, primary_col, secondary_col)
 
     def _convert_numpy_types(self, obj: Dict) -> Dict:
-        """Convert numpy types to Python types."""
+        """Convert numpy scalar types to native Python types."""
         for key, value in obj.items():
             if isinstance(value, (np.integer, np.int64, np.int32)):
                 obj[key] = int(value)
@@ -660,7 +806,7 @@ class GridSearch:
         print(f"  {'─' * 75}")
 
     def _save_summary_report(self, best: Dict, top5: List[Dict], primary_col: str, secondary_col: str) -> None:
-        """Save a text summary report."""
+        """Save a plain-text summary report."""
         report_path = self.results_dir / f"grid_search_summary_{self.suffix}.txt"
 
         with open(report_path, "w") as f:

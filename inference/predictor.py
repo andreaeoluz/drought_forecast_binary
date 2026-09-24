@@ -17,7 +17,7 @@ from utils.spatial import postprocess_binary_mask
 
 
 class InferencePredictor:
-    """Handles inference on test period with optional calibration and fallback."""
+    """Handles inference on the test period with optional calibration and fallback."""
 
     def __init__(
         self,
@@ -26,45 +26,50 @@ class InferencePredictor:
         p: int,
         q: int,
         model_type: str = "pretrained",
-        optimization_metric: str = None,  # ← None = usa config
-        use_calibration: bool = None,     # ← None = usa config
+        optimization_metric: str = None,
+        use_calibration: bool = None,
         use_validation_fallback: bool = True,
         fixed_threshold: Optional[float] = None,
+        model_dir: Optional[Path] = None,
     ):
         """
-        Initialize inference predictor.
+        Initialize the inference predictor.
 
         Args:
-            config: Experiment configuration
-            base_data_path: Path to data directory
-            p: History length
-            q: Forecast horizon
-            model_type: 'pretrained' or 'scratch'
-            optimization_metric: Metric for threshold optimization ('mcc' or 'csi').
-                If None, uses config.optimization.primary_metric.
-            use_calibration: Whether to apply probability calibration.
-                If None, uses config.training.calibrate.
-            use_validation_fallback: Whether to use validation for threshold calibration
-            fixed_threshold: If provided, use this threshold instead of optimizing
+            config: Experiment configuration.
+            base_data_path: Path to the raw data directory.
+            p: History length.
+            q: Forecast horizon.
+            model_type: 'pretrained' or 'scratch'.
+            optimization_metric: Metric for threshold optimization ('mcc' or
+                'csi'). If None, uses config.optimization.primary_metric.
+            use_calibration: Whether to apply probability calibration. If
+                None, uses config.training.calibrate.
+            use_validation_fallback: Whether to use validation data for
+                threshold calibration.
+            fixed_threshold: If provided, use this threshold instead of
+                optimizing one.
+            model_dir: Optional custom directory to search for the model
+                checkpoint (and calibrator.pkl) before the standard
+                grid-search locations.
         """
         self.config = config
         self.base_data_path = base_data_path
         self.p = p
         self.q = q
         self.model_type = model_type
-        
-        # ✅ Métrica de otimização (com fallback para config)
+        self.model_dir = Path(model_dir) if model_dir else None
+
         if optimization_metric is None:
             self.optimization_metric = config.optimization.primary_metric
         else:
             self.optimization_metric = optimization_metric
-        
-        # ✅ Calibração (com fallback para config)
+
         if use_calibration is None:
             self.use_calibration = getattr(config.training, 'calibrate', False)
         else:
             self.use_calibration = use_calibration
-        
+
         self.use_validation_fallback = use_validation_fallback
         self.fixed_threshold = fixed_threshold
         self.calibrator = None
@@ -84,9 +89,8 @@ class InferencePredictor:
         self._load_model()
         self._load_calibrator()
         self._setup_postprocessing()
-        
-        # ✅ Log das configurações
-        self.logger.info(f"📊 InferencePredictor initialized:")
+
+        self.logger.info("📊 InferencePredictor initialized:")
         self.logger.info(f"   Optimization metric: {self.optimization_metric.upper()}")
         self.logger.info(f"   Calibration: {'✅ ENABLED' if self.use_calibration else '❌ DISABLED'}")
         self.logger.info(f"   Validation fallback: {'✅ ENABLED' if self.use_validation_fallback else '❌ DISABLED'}")
@@ -94,15 +98,18 @@ class InferencePredictor:
             self.logger.info(f"   Fixed threshold: {self.fixed_threshold:.3f}")
 
     def _setup_postprocessing(self):
-        """Setup spatial post-processing parameters."""
-        factor = self.config.data.downsample_h
-        min_area_original = getattr(self.config, 'min_area_original_pixels', 10)
-        min_area = max(1, min_area_original // (factor ** 2))
+        """Set up spatial post-processing parameters (min object/hole area)."""
+        min_area_original = getattr(self.config, 'min_area_original_pixels', None)
+        if min_area_original is not None:
+            factor_h, _factor_w = self.config.get_downsample(self.config.region)
+            min_area = max(1, min_area_original // (factor_h ** 2))
+        else:
+            min_area = self.config.min_area_downsampled
         self.min_area = min_area
         self.hole_area = max(1, self.min_area // 2)
 
     def _load_data(self):
-        """Load climate data, SPI and normalizer."""
+        """Load climate data, SPI, and the normalizer."""
         self.logger.info("Loading data...")
         out = load_region_timeseries(self.base_data_path, self.config)
         self.data = out["data"]
@@ -116,7 +123,7 @@ class InferencePredictor:
         self._setup_temporal_indices()
 
     def _resize_valid_mask(self):
-        """Resize validity mask to match data dimensions."""
+        """Resize the validity mask to match the data resolution."""
         if self.valid_mask is None:
             return
         target_shape = self.data.shape[1:3]
@@ -130,7 +137,7 @@ class InferencePredictor:
             ).astype(bool)
 
     def _load_spi(self):
-        """Load and resize SPI data."""
+        """Load and resize the cached SPI series."""
         spi, _ = load_spi_cache(self.config.spi.scale, self.paths["spi_cache_dir"])
         self.spi = spi
         if self.spi is None:
@@ -152,21 +159,38 @@ class InferencePredictor:
             self.spi = spi_resized
 
     def _load_normalizer(self):
-        """Load climate normalizer."""
-        normalizer_path = self.paths["autoencoder_dir"] / "normalizer.json"
-        if not normalizer_path.exists():
-            normalizer_path = self.paths["grid_search_dir"] / "normalizer.json"
-        if not normalizer_path.exists():
-            raise FileNotFoundError(f"Normalizer not found: {normalizer_path}")
+        """Load the climate normalizer matching this model's training.
+
+        A pretrained/transfer-learning model's encoder was fine-tuned on
+        data normalized with the autoencoder's own normalizer (see
+        GridSearch.load_data) - it must be served with that exact same
+        normalizer. A scratch model was trained on a fresh normalizer fit
+        on the classification task's own train split, saved separately so
+        the two never collide (they legitimately differ).
+        """
+        if self.model_type == "scratch":
+            candidates = [
+                self.paths["grid_search_dir"] / "normalizer_scratch.json",
+                self.paths["autoencoder_dir"] / "normalizer.json",  # legacy fallback
+            ]
+        else:
+            candidates = [
+                self.paths["autoencoder_dir"] / "normalizer.json",
+                self.paths["grid_search_dir"] / "normalizer_pretrained.json",
+            ]
+
+        normalizer_path = next((p for p in candidates if p.exists()), None)
+        if normalizer_path is None:
+            raise FileNotFoundError(f"Normalizer not found among: {candidates}")
+
         self.normalizer = ClimateNormalizer.load(normalizer_path)
-        self.logger.success(f"Normalizer loaded: {normalizer_path}")
+        self.logger.success(f"Normalizer loaded ({self.model_type}): {normalizer_path}")
 
     def _setup_temporal_indices(self):
-        """Setup temporal indices for test and validation periods."""
+        """Set up temporal indices for the test and validation periods."""
         self.time_idx = np.array([y * 12 + (m - 1) for y, m in zip(self.years, self.months)])
         split = self.config.split
 
-        # Test period
         test_start = split.ym_to_int(split.test[0])
         test_end = split.ym_to_int(split.test[1])
         self.test_mask = (self.time_idx >= test_start) & (self.time_idx <= test_end)
@@ -175,7 +199,6 @@ class InferencePredictor:
         self.test_months = self.months[self.test_mask]
         self.spi_test = self.spi[self.test_mask] if self.spi is not None else None
 
-        # Validation period (GS validation)
         val_start = split.ym_to_int(split.val_gs[0])
         val_end = split.ym_to_int(split.val_gs[1])
         self.val_mask = (self.time_idx >= val_start) & (self.time_idx <= val_end)
@@ -188,44 +211,111 @@ class InferencePredictor:
         self.logger.info(f"Validation period: {len(self.val_indices)} months")
 
     def _find_model_path(self) -> Path:
-        """Find the model checkpoint path."""
+        """Find the model checkpoint path.
+
+        Only searches locations consistent with self.model_type. The
+        previous version always probed grid_search_pretrained first
+        regardless of model_type, so any "scratch" inference request
+        silently loaded the pretrained checkpoint whenever one existed for
+        the same (p, q) - which it almost always does - making every
+        scratch inference run byte-identical to the pretrained one.
+        """
         model_filename = f"model_p{self.p}_q{self.q}.pth"
-        candidates = [
-            self.paths["grid_search_pretrained"] / model_filename,
-            self.paths["grid_search_scratch"] / model_filename,
+        type_dir = (
+            self.paths["grid_search_pretrained"] if self.model_type == "pretrained"
+            else self.paths["grid_search_scratch"]
+        )
+        candidates = []
+        if self.model_dir is not None:
+            candidates.append(self.model_dir / model_filename)
+        candidates += [
+            type_dir / model_filename,
             self.paths["grid_search_dir"] / self.model_type / model_filename,
-            self.paths["grid_search_dir"] / model_filename,
         ]
         for path in candidates:
             if path.exists():
                 self.logger.info(f"Model found: {path}")
                 return path
         raise FileNotFoundError(
-            f"Model not found for p={self.p}, q={self.q}, type={self.model_type}"
+            f"Model not found for p={self.p}, q={self.q}, type={self.model_type} "
+            f"(checked: {[str(c) for c in candidates]})"
         )
 
     def _load_model(self):
-        """Load the trained model."""
+        """Load the trained model checkpoint.
+
+        The model architecture is built to match what's ACTUALLY in the
+        checkpoint's state_dict, not blindly from `config.get_model_config`.
+        This matters since the addition of the multiscale temporal module
+        and the residual adapter (see models/predictor.py): both are
+        randomly initialized when the model is constructed, and if a
+        checkpoint trained *before* those components existed were loaded
+        into a model built with them enabled (as a naive
+        `ConvLSTMPredictor(config.get_model_config(...))` would do), the
+        random multiscale context would get added into the latent (with
+        weight `multiscale_weight`) at inference time even though the model
+        never learned to expect it - silently corrupting predictions from
+        every pre-upgrade checkpoint instead of failing loudly. Detecting
+        the architecture from the checkpoint itself keeps old and new
+        checkpoints both loading correctly, regardless of the *current*
+        default config.
+        """
         checkpoint_path = self._find_model_path()
         self.logger.info(f"Loading model: {checkpoint_path}")
-        model_config = self.config.get_model_config("predictor")
-        self.model = ConvLSTMPredictor(model_config).to(self.config.device)
         checkpoint = torch.load(checkpoint_path, map_location=self.config.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        state_dict = checkpoint["model_state_dict"]
+
+        model_config = self.config.get_model_config("predictor")
+        self._reconcile_architecture_with_checkpoint(model_config, state_dict)
+
+        self.model = ConvLSTMPredictor(model_config).to(self.config.device)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing:
+            self.logger.debug(f"  (state_dict missing keys, kept at init: {missing})")
+        if unexpected:
+            self.logger.warning(f"  ⚠️ state_dict had unexpected keys, ignored: {unexpected}")
+
         self.model.eval()
         self.best_threshold = checkpoint.get("best_threshold", 0.20)
         self.best_csi = checkpoint.get("best_csi", 0.0)
         self.best_mcc = checkpoint.get("best_mcc", 0.0)
         self.logger.success(f"Model loaded (CSI: {self.best_csi:.4f}, MCC: {self.best_mcc:.4f})")
 
+    def _reconcile_architecture_with_checkpoint(self, model_config: dict, state_dict: dict) -> None:
+        """
+        Mutate `model_config` in place so `use_attention`, `use_multiscale`
+        and `use_residual_adapter` match what the checkpoint was actually
+        trained with, overriding whatever the current experiment config
+        says. Logs a warning whenever an override happens, since it means
+        this checkpoint predates (or otherwise differs from) the currently
+        configured architecture.
+        """
+        component_prefixes = {
+            "use_attention": "attention.",
+            "use_multiscale": "multiscale.",
+            "use_residual_adapter": "residual_adapter.",
+        }
+
+        for config_key, prefix in component_prefixes.items():
+            present_in_checkpoint = any(k.startswith(prefix) for k in state_dict)
+            configured = model_config.get(config_key, True)
+
+            if present_in_checkpoint != configured:
+                self.logger.warning(
+                    f"  ⚠️ Architecture mismatch for '{config_key}': config={configured}, "
+                    f"checkpoint has it={present_in_checkpoint}. Using the checkpoint's "
+                    f"architecture (this model was likely trained before/after this "
+                    f"component was added)."
+                )
+                model_config[config_key] = present_in_checkpoint
+
     def _load_calibrator(self):
-        """Load probability calibrator if enabled."""
+        """Load the probability calibrator, if enabled."""
         if not self.use_calibration:
             return
         self.logger.info("Loading calibrator...")
         checkpoint_path = self._find_model_path()
 
-        # Try to load from checkpoint
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.config.device, weights_only=False)
             if "calibrator" in checkpoint and checkpoint["calibrator"] is not None:
@@ -235,8 +325,10 @@ class InferencePredictor:
         except Exception as e:
             self.logger.debug(f"Could not load calibrator from checkpoint: {e}")
 
-        # Try to load from pickle file
-        calibrator_paths = [
+        calibrator_paths = []
+        if self.model_dir is not None:
+            calibrator_paths.append(self.model_dir / "calibrator.pkl")
+        calibrator_paths += [
             checkpoint_path.parent / "calibrator.pkl",
             self.paths["grid_search_dir"] / "calibrator.pkl",
         ]
@@ -253,20 +345,18 @@ class InferencePredictor:
         self.logger.warning("Calibrator not found. Using raw probabilities.")
 
     def _calibrate_probs(self, probs: np.ndarray) -> np.ndarray:
-        """Apply calibration to probabilities."""
+        """Apply the fitted calibrator to raw probabilities."""
         if self.calibrator is None or not self.use_calibration:
             return probs
 
-        # ✅ USAR O CALIBRADOR (seja Platt ou Isotonic)
         original_shape = probs.shape
         probs_flat = probs.flatten()
-        
-        # O calibrador já tem o método transform
+
         calibrated = self.calibrator.transform(probs_flat)
         return calibrated.reshape(original_shape)
 
     def _prepare_data(self, data_subset: np.ndarray, months_subset: np.ndarray) -> np.ndarray:
-        """Prepare data for inference (normalize + transpose)."""
+        """Prepare data for inference (normalize + channels-first)."""
         data_norm = self.normalizer.transform(data_subset, months_subset, self.valid_mask)
         data_norm = np.nan_to_num(data_norm, nan=0.0)
         return np.transpose(data_norm, (0, 3, 1, 2))
@@ -276,10 +366,12 @@ class InferencePredictor:
         min_required = self.p + self.q
         if data_len <= min_required:
             return []
-        return list(range(self.p, data_len - self.q))
+        # target_idx = t + q - 1 (see predict_subset), so the last usable
+        # t is data_len - q, not data_len - q - 1.
+        return list(range(self.p, data_len - self.q + 1))
 
     def _filter_valid_pixels(self, probs_stack: np.ndarray, targets_stack: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Filter valid pixels using the validity mask."""
+        """Filter to valid pixels using the validity mask."""
         probs_flat = probs_stack.flatten()
         targets_flat = targets_stack.flatten()
 
@@ -294,24 +386,21 @@ class InferencePredictor:
 
         valid = ~(np.isnan(probs_flat) | np.isnan(targets_flat))
         return probs_flat[valid], targets_flat[valid]
-    
+
     def _optimize_threshold(self, probs: np.ndarray, targets: np.ndarray) -> Tuple[float, Dict]:
-        """Optimize threshold using adaptive range."""
+        """Optimize the decision threshold over an adaptive range."""
         thresholds = self.config.calibration_thresholds
-        
-        # Filtrar thresholds para o range relevante
+
         p1 = np.percentile(probs, 1)
         p99 = np.percentile(probs, 99)
-        
-        # Usar apenas thresholds dentro do range
+
         thresholds = [t for t in thresholds if p1 <= t <= p99]
-        
+
         if len(thresholds) < 10:
-            # Fallback para range adaptativo
             low = max(0.001, p1 - 0.02)
             high = min(0.999, p99 + 0.02)
             thresholds = np.arange(low, high + 0.005, 0.005)
-        
+
         return find_best_threshold(probs, targets, thresholds, metric=self.optimization_metric)
 
     def predict_subset(
@@ -325,13 +414,13 @@ class InferencePredictor:
         Make predictions on a data subset.
 
         Args:
-            data_subset: Climate data (T, H, W, C)
-            months_subset: Month indices (T,)
-            spi_subset: SPI values (T, H, W)
-            fixed_threshold: If provided, use this threshold instead of optimizing
+            data_subset: Climate data (T, H, W, C).
+            months_subset: Month indices (T,).
+            spi_subset: SPI values (T, H, W).
+            fixed_threshold: If provided, use this threshold instead of optimizing.
 
         Returns:
-            Dictionary with predictions, targets, metrics, and threshold
+            Dict with predictions, targets, metrics, and threshold.
         """
         data_ch = self._prepare_data(data_subset, months_subset)
         T, C, H, W = data_ch.shape
@@ -345,12 +434,19 @@ class InferencePredictor:
 
         binary_mask = (spi_subset <= self.config.spi.threshold).astype(np.float32)
 
+        mask_tensor = None
+        if self.valid_mask is not None:
+            mask_tensor = torch.from_numpy(self.valid_mask.astype(np.float32)).to(self.config.device)
+
         with torch.no_grad():
             for t in indices:
-                target_idx = t + self.q
+                # Matches ClimateDataset's convention: window is
+                # data_ch[t-p:t] (ends at t-1), target is the qth month
+                # after that window, i.e. B_{(t-p)+p+q-1} = B_{t+q-1}.
+                target_idx = t + self.q - 1
                 x_seq = data_ch[t - self.p:t]
                 x_tensor = torch.from_numpy(x_seq).float().unsqueeze(0).to(self.config.device)
-                logits, _ = self.model(x_tensor)
+                logits, _ = self.model(x_tensor, mask=mask_tensor)
                 probs = torch.sigmoid(logits).cpu().numpy()[0, 0]
                 all_probs.append(probs)
                 all_targets.append(binary_mask[target_idx])
@@ -358,11 +454,9 @@ class InferencePredictor:
         probs_stack = np.stack(all_probs)
         targets_stack = np.stack(all_targets)
 
-        # Apply calibration if enabled
         if self.use_calibration and self.calibrator is not None:
             probs_stack = self._calibrate_probs(probs_stack)
 
-        # Filter valid pixels
         probs_flat, targets_flat = self._filter_valid_pixels(probs_stack, targets_stack)
 
         if len(probs_flat) == 0:
@@ -374,18 +468,15 @@ class InferencePredictor:
                 "n_samples": len(indices),
             }
 
-        # Use fixed threshold if provided, otherwise optimize
         if fixed_threshold is not None:
-            # Compute metrics at fixed threshold
             from evaluation.metrics import compute_metrics
-            preds = (probs_flat > fixed_threshold).astype(np.int32)
+            preds = (probs_flat >= fixed_threshold).astype(np.int32)
             tp = np.sum((preds == 1) & (targets_flat == 1))
             fp = np.sum((preds == 1) & (targets_flat == 0))
             fn = np.sum((preds == 0) & (targets_flat == 1))
             tn = np.sum((preds == 0) & (targets_flat == 0))
 
-            from evaluation.metrics import compute_metrics as compute_metrics_dict
-            best_metrics = compute_metrics_dict(tp, fp, fn, tn)
+            best_metrics = compute_metrics(tp, fp, fn, tn)
             best_thr = fixed_threshold
         else:
             best_thr, best_metrics = self._optimize_threshold(probs_flat, targets_flat)
@@ -402,110 +493,103 @@ class InferencePredictor:
         """
         Run inference on the test period.
 
+        The decision threshold is always resolved BEFORE looking at the test
+        predictions, using (in order of precedence):
+          1. An explicit ``fixed_threshold`` (e.g. ``--threshold``).
+          2. A recalibration performed exclusively on the validation split,
+             if explicitly requested (``use_validation_fallback`` /
+             ``--recalibrate``) — never on test.
+          3. By default, the threshold already fixed on validation during
+             grid search / model selection and stored in the checkpoint
+             (``best_threshold``).
+        The test split's own predictions are used only to compute the final
+        metrics — never to choose the threshold.
+
         Returns:
-            Dictionary with predictions, metrics, and configuration
+            Dict with predictions, metrics, and configuration.
         """
         self.logger.header(f"INFERENCE - p={self.p}, q={self.q}")
 
-        # Log configuration
         self.logger.info(f"Calibration: {'✅ ENABLED' if self.use_calibration else '❌ DISABLED'}")
-        self.logger.info(f"Validation fallback: {'✅ ENABLED' if self.use_validation_fallback else '❌ DISABLED'}")
-
-        if self.fixed_threshold is not None:
-            self.logger.info(f"🔒 Fixed threshold: {self.fixed_threshold:.3f} (optimization SKIPPED)")
+        self.logger.info(f"Validation recalibration: {'✅ ENABLED' if self.use_validation_fallback else '❌ DISABLED'}")
 
         if self.spi_test is None:
             self.logger.error("SPI test data not available")
             return {"success": False}
 
-        # Get test samples
+        # =====================================================================
+        # RESOLVE THE DECISION THRESHOLD (never using test data)
+        # =====================================================================
+        calibration_metrics = None
+        used_recalibration = False
+
+        if self.fixed_threshold is not None:
+            threshold_to_apply = self.fixed_threshold
+            self.logger.info(f"🔒 Fixed threshold: {threshold_to_apply:.3f} (validation recalibration SKIPPED)")
+        elif self.use_validation_fallback and self.spi_val is not None:
+            self.logger.info("Recalibrating threshold on the validation period only...")
+            val_result = self.predict_subset(
+                self.val_data,
+                self.val_months,
+                self.spi_val,
+                fixed_threshold=None,  # Optimize exclusively on validation
+            )
+            if val_result["probs"] is not None:
+                threshold_to_apply = val_result["threshold"]
+                calibration_metrics = val_result["metrics"]
+                used_recalibration = True
+                self.logger.info(f"Validation-recalibrated threshold: {threshold_to_apply:.3f}")
+                self.logger.info(f"Validation CSI: {calibration_metrics['csi']:.4f}")
+                self.logger.info(f"Validation MCC: {calibration_metrics['mcc']:.4f}")
+            else:
+                threshold_to_apply = self.best_threshold
+                self.logger.warning(
+                    "Validation recalibration failed (no predictions); "
+                    f"falling back to the checkpoint threshold: {threshold_to_apply:.3f}"
+                )
+        else:
+            threshold_to_apply = self.best_threshold
+            self.logger.info(
+                f"Using the validation-selected threshold from the checkpoint: {threshold_to_apply:.3f}"
+            )
+
         test_data_len = len(self.test_data)
         test_samples_possible = max(0, test_data_len - self.p - self.q + 1)
 
         self.logger.info(f"Test period: {len(self.test_indices)} months")
         self.logger.info(f"Possible samples: {test_samples_possible} (p={self.p}, q={self.q})")
 
-        # Run prediction on test data
+        # Run prediction on test data with the threshold resolved above —
+        # the test split is only ever used to compute metrics, never to
+        # choose the threshold.
         test_result = self.predict_subset(
             self.test_data,
             self.test_months,
             self.spi_test,
-            fixed_threshold=self.fixed_threshold
+            fixed_threshold=threshold_to_apply,
         )
 
         if test_result["probs"] is None:
             self.logger.error("No test samples available")
             return {"success": False}
 
-        test_samples = test_result["n_samples"]
-        self.logger.info(f"Test samples: {test_samples}")
+        test_result["used_fallback"] = used_recalibration
+        test_result["calibration_metrics"] = calibration_metrics
 
-        # Check if we should use validation fallback for threshold calibration
-        min_samples_for_eval = 5
-        use_fallback = (
-            self.use_validation_fallback
-            and test_samples < min_samples_for_eval
-            and self.spi_val is not None
-            and self.fixed_threshold is None  # ✅ Don't use fallback if threshold is fixed
-        )
+        self.logger.info(f"Test samples: {test_result['n_samples']}")
 
-        if use_fallback:
-            self.logger.warning(f"Test has only {test_samples} samples (< {min_samples_for_eval})")
-            self.logger.info("Using validation period for threshold calibration...")
-
-            val_result = self.predict_subset(
-                self.val_data,
-                self.val_months,
-                self.spi_val,
-                fixed_threshold=None  # Optimize on validation
-            )
-
-            if val_result["probs"] is None:
-                self.logger.warning("Validation predictions failed. Using test threshold.")
-                final_threshold = test_result["threshold"]
-                calibration_metrics = None
-            else:
-                final_threshold = val_result["threshold"]
-                calibration_metrics = val_result["metrics"]
-                self.logger.info(f"Calibrated threshold: {final_threshold:.3f}")
-                self.logger.info(f"Calibration CSI: {calibration_metrics['csi']:.4f}")
-                self.logger.info(f"Calibration MCC: {calibration_metrics['mcc']:.4f}")
-
-            test_result["threshold"] = final_threshold
-            test_result["calibration_metrics"] = calibration_metrics
-            test_result["used_fallback"] = True
-            test_result["validation_samples"] = val_result["n_samples"] if val_result["probs"] is not None else 0
-
-            # ✅ Recompute test metrics with final threshold
-            if self.fixed_threshold is None:
-                probs_flat, targets_flat = self._filter_valid_pixels(
-                    test_result["probs"], test_result["targets"]
-                )
-                if len(probs_flat) > 0:
-                    from evaluation.metrics import compute_metrics
-                    preds = (probs_flat > final_threshold).astype(np.int32)
-                    tp = np.sum((preds == 1) & (targets_flat == 1))
-                    fp = np.sum((preds == 1) & (targets_flat == 0))
-                    fn = np.sum((preds == 0) & (targets_flat == 1))
-                    tn = np.sum((preds == 0) & (targets_flat == 0))
-                    test_result["metrics"] = compute_metrics(tp, fp, fn, tn)
-
-        else:
-            test_result["used_fallback"] = False
-            test_result["calibration_metrics"] = None
-
-        # Log results
         self.logger.success("Inference complete")
         self.logger.info(f"  Samples: {test_result['n_samples']}")
         self.logger.info(f"  Threshold: {test_result['threshold']:.3f}")
         self.logger.info(f"  CSI: {test_result['metrics']['csi']:.4f}")
         self.logger.info(f"  MCC: {test_result['metrics']['mcc']:.4f}")
 
-        if test_result.get("used_fallback", False):
-            self.logger.info(f"  Fallback used: YES (validation samples: {test_result.get('validation_samples', 0)})")
-
-        if self.fixed_threshold is not None:
-            self.logger.info(f"  Fixed threshold: {self.fixed_threshold:.3f} (applied)")
+        if used_recalibration:
+            self.logger.info("  Threshold source: validation recalibration")
+        elif self.fixed_threshold is not None:
+            self.logger.info(f"  Threshold source: fixed ({self.fixed_threshold:.3f})")
+        else:
+            self.logger.info("  Threshold source: checkpoint (validation-selected during grid search)")
 
         return test_result
 
@@ -514,7 +598,7 @@ class InferencePredictor:
         Save prediction rasters as GeoTIFF.
 
         Args:
-            result: Result dictionary from run_inference()
+            result: Result dict from run_inference().
         """
         if result is None or result.get("probs") is None:
             self.logger.error("No results to save")
@@ -553,13 +637,11 @@ class InferencePredictor:
                 continue
             year, month = date_info
 
-            # Probability raster
             prob = probs[i].astype(np.float32)
             prob[~valid_mask] = prob_profile['nodata']
             self._save_raster(prob_dir / f"prob_{year}_{month:02d}.tif", prob, prob_profile)
 
-            # Binary prediction with post-processing
-            binary = (prob > threshold).astype(np.uint8)
+            binary = (prob >= threshold).astype(np.uint8)
             if binary.sum() > 0:
                 binary = postprocess_binary_mask(
                     binary.astype(np.float32),
@@ -570,7 +652,6 @@ class InferencePredictor:
             binary[~valid_mask] = 255
             self._save_raster(pred_dir / f"pred_{year}_{month:02d}.tif", binary, binary_profile)
 
-            # Ground truth
             truth = targets[i].astype(np.uint8)
             truth[~valid_mask] = 255
             self._save_raster(truth_dir / f"truth_{year}_{month:02d}.tif", truth, binary_profile)
@@ -580,13 +661,13 @@ class InferencePredictor:
         if saved_count > 0:
             self.logger.success(f"Rasters saved to: {pred_dir.parent}")
             self.logger.info(f"  {saved_count} files generated")
-            self.logger.info(f"  nodata=255 for binaries (0=drought, 1=non-drought, 255=invalid)")
+            self.logger.info("  nodata=255 for binaries (0=non-drought, 1=drought, 255=invalid)")
             self.logger.info(f"  Post-processing: min_area={self.min_area}, hole_area={self.hole_area}")
         else:
             self.logger.warning("No rasters were saved")
 
     def _create_raster_profiles(self, shape: Tuple[int, int]) -> Tuple[Dict, Dict]:
-        """Create raster profiles for probability and binary rasters."""
+        """Create raster profiles for the probability and binary rasters."""
         H, W = shape
 
         prob_profile = {
@@ -618,11 +699,19 @@ class InferencePredictor:
         if 'crs' in self.metadata:
             prob_profile['crs'] = self.metadata['crs']
             binary_profile['crs'] = self.metadata['crs']
+        if 'transform' in self.metadata:
+            # Without this, rasterio defaults to the identity transform, so
+            # every saved raster carries a valid CRS but no real geographic
+            # extent - axes on any figure built from these files (lon/lat
+            # via _get_geo_coords) end up showing raw pixel indices mislabeled
+            # as degrees, even though the CRS metadata looks correct.
+            prob_profile['transform'] = self.metadata['transform']
+            binary_profile['transform'] = self.metadata['transform']
 
         return prob_profile, binary_profile
 
     def _get_valid_mask(self, shape: Tuple[int, int]) -> np.ndarray:
-        """Get validity mask resized to the given shape."""
+        """Get the validity mask resized to the given shape."""
         if self.valid_mask is not None:
             if self.valid_mask.shape != shape:
                 from skimage.transform import resize
@@ -636,10 +725,20 @@ class InferencePredictor:
         return np.ones(shape, dtype=bool)
 
     def _get_date_info(self, idx: int) -> Optional[Tuple[int, int]]:
-        """Get (year, month) for a given index in the test period."""
-        test_indices = self.test_indices
-        if idx < len(test_indices):
-            global_idx = test_indices[idx] + self.q
+        """
+        Get (year, month) for a given sample index in the test period.
+
+        `predict_subset()` builds sample `idx` from the local index
+        `t = self.p + idx` within `test_data` (since its `indices` range
+        over `range(self.p, T - self.q + 1)`), with the target at
+        `t + self.q - 1` (window ends at `t-1`; target is the qth month
+        after that window — same convention as ClimateDataset). The global
+        target index therefore has to add `p`, `idx`, and `q - 1`, or every
+        saved raster ends up labeled one month later than it should.
+        """
+        target_local_idx = self.p + idx + self.q - 1
+        if target_local_idx < len(self.test_indices):
+            global_idx = self.test_indices[target_local_idx]
             if global_idx < len(self.months):
                 return self.years[global_idx], self.months[global_idx]
         return None
@@ -651,7 +750,7 @@ class InferencePredictor:
             dst.write(data, 1)
 
     def _save_as_numpy(self, result: Dict):
-        """Fallback: save results as numpy files."""
+        """Fallback: save results as numpy files when rasterio is unavailable."""
         probs = result["probs"]
         targets = result["targets"]
         threshold = result["threshold"]
@@ -662,7 +761,7 @@ class InferencePredictor:
 
         np.save(output_dir / "probs.npy", probs)
         np.save(output_dir / "targets.npy", targets)
-        np.save(output_dir / "binary.npy", (probs > threshold).astype(np.uint8))
+        np.save(output_dir / "binary.npy", (probs >= threshold).astype(np.uint8))
 
         if self.valid_mask is not None:
             np.save(output_dir / "valid_mask.npy", self.valid_mask)

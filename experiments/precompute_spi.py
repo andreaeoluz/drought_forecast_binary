@@ -16,7 +16,7 @@ from utils.logger import Logger, Colors
 
 
 # ============================================================================
-# FUNÇÕES AUXILIARES
+# HELPER FUNCTIONS
 # ============================================================================
 
 def validate_mask(valid_mask: np.ndarray, precipitation: np.ndarray, logger: Logger) -> None:
@@ -29,7 +29,7 @@ def validate_mask(valid_mask: np.ndarray, precipitation: np.ndarray, logger: Log
     valid_pixels = valid_mask.sum()
     invalid_pixels = total_pixels - valid_pixels
 
-    logger.info(f"\n📊 Validity Mask:")
+    logger.info("\n📊 Validity Mask:")
     logger.info(f"   Total pixels: {total_pixels:,}")
     logger.info(f"   Valid: {valid_pixels:,} ({valid_pixels/total_pixels:.1%})")
     logger.info(f"   Invalid: {invalid_pixels:,} ({invalid_pixels/total_pixels:.1%})")
@@ -38,7 +38,7 @@ def validate_mask(valid_mask: np.ndarray, precipitation: np.ndarray, logger: Log
     zero_pixels = (precipitation[0] == 0)
     zero_valid = zero_pixels & valid_mask
 
-    logger.info(f"\n📊 Zero precipitation (non-drought) pixels:")
+    logger.info("\n📊 Zero precipitation (non-drought) pixels:")
     logger.info(f"   Total: {zero_pixels.sum():,}")
     logger.info(f"   Valid in mask: {zero_valid.sum():,}")
 
@@ -56,7 +56,6 @@ def display_spi_statistics(stats: Dict[str, Any], logger: Logger) -> None:
 
     logger.section("📊 SPI STATISTICS")
 
-    # Basic statistics
     logger.table({
         "Scale": f"{stats.get('scale', 3)} months",
         "Timesteps": stats.get('total_timesteps', 0),
@@ -69,7 +68,6 @@ def display_spi_statistics(stats: Dict[str, Any], logger: Logger) -> None:
         "Median": f"{stats.get('median', 0):.4f}",
     })
 
-    # SPI Categories
     if "categories" in stats:
         logger.section("🌡️  SPI CATEGORIES")
         categories = stats["categories"]
@@ -88,7 +86,7 @@ def display_spi_statistics(stats: Dict[str, Any], logger: Logger) -> None:
 
 
 # ============================================================================
-# FUNÇÃO PRINCIPAL
+# MAIN ENTRY POINT
 # ============================================================================
 
 def main() -> None:
@@ -115,14 +113,13 @@ def main() -> None:
     base_data_path = get_data_path()
     out = load_region_timeseries(base_data_path, config)
 
-    # Extract precipitation
     pr_index = config.data.bands.index("pr")
     precipitation = out["data"][..., pr_index]
 
     T, H, W = precipitation.shape
     period = f"{out['years'][0]}-{out['months'][0]:02d} to {out['years'][-1]}-{out['months'][-1]:02d}"
 
-    logger.info(f"\n📊 Precipitation data:")
+    logger.info("\n📊 Precipitation data:")
     logger.info(f"   Shape: {precipitation.shape}")
     logger.info(f"   Period: {period}")
     logger.info(f"   Total pixels: {H * W:,}")
@@ -145,17 +142,15 @@ def main() -> None:
         min_samples=config.spi.min_samples,
     )
 
-    # Apply validity mask to SPI
     if out["valid_mask"] is not None:
         spi[:, ~out["valid_mask"]] = np.nan
         delta_spi[:, ~out["valid_mask"]] = np.nan
 
-    # Check results
     total_values = spi.size
     valid_values = (~np.isnan(spi)).sum()
     nan_values = total_values - valid_values
 
-    logger.info(f"\n📊 SPI computation complete:")
+    logger.info("\n📊 SPI computation complete:")
     logger.info(f"   Total values: {total_values:,}")
     logger.info(f"   Valid values: {valid_values:,} ({valid_values/total_values:.1%})")
     logger.info(f"   NaN values: {nan_values:,} ({nan_values/total_values:.1%})")
@@ -167,7 +162,7 @@ def main() -> None:
     # ------------------------------------------------------------------------
     # ANALYZE STATISTICS
     # ------------------------------------------------------------------------
-    logger.info(f"\n📊 Analyzing SPI statistics...")
+    logger.info("\n📊 Analyzing SPI statistics...")
 
     stats = analyze_spi_statistics(
         spi=spi,
@@ -182,7 +177,7 @@ def main() -> None:
     # ------------------------------------------------------------------------
     # SAVE TO CACHE
     # ------------------------------------------------------------------------
-    logger.info(f"\n💾 Saving SPI to cache...")
+    logger.info("\n💾 Saving SPI to cache...")
 
     save_spi_cache(
         spi=spi,
@@ -209,9 +204,9 @@ def main() -> None:
     # ------------------------------------------------------------------------
     # NEXT STEPS
     # ------------------------------------------------------------------------
-    logger.info(f"\n💡 Next steps:")
-    logger.info(f"   1. Train autoencoder: python main.py train-ae")
-    logger.info(f"   2. Run grid search: python main.py grid-search")
+    logger.info("\n💡 Next steps:")
+    logger.info("   1. Train autoencoder: python main.py train-ae")
+    logger.info("   2. Run grid search: python main.py grid-search")
 
 
 if __name__ == "__main__":

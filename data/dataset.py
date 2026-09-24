@@ -5,23 +5,25 @@ import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 from typing import Optional, Dict, Any, List
 
+from .preprocessing import build_temporal_valid_mask
+
 
 class ClimateDataset(Dataset):
     """
-    Dataset for autoencoder or binary classification.
+    Dataset for autoencoder pretraining or binary drought classification.
 
-    Definição temporal (Opção B - formal):
-    
-    Para mode="classification":
-        - Entrada: X_t = [I_t, I_{t+1}, ..., I_{t+p-1}] (p meses)
-        - Target: Y_t = B_{t+p+q-1} (q meses após o fim da janela)
-        - Portanto: q é o horizonte de previsão (meses à frente)
-        - q=1 → próximo mês após a janela
-        - q=3 → terceiro mês após a janela
+    Temporal definition:
 
-    Para mode="autoencoder":
-        - Entrada: X_t = [I_t, I_{t+1}, ..., I_{t+p-1}] (p meses)
-        - Reconstrução: toda a sequência
+    For mode="classification":
+        - Input: X_t = [I_t, I_{t+1}, ..., I_{t+p-1}] (p months)
+        - Target: Y_t = B_{t+p+q-1} (q months after the end of the window)
+        - q is therefore the forecast horizon, in months
+        - q=1 -> the month immediately after the window
+        - q=3 -> the third month after the window
+
+    For mode="autoencoder":
+        - Input: X_t = [I_t, I_{t+1}, ..., I_{t+p-1}] (p months)
+        - Reconstruction target: the full input sequence
     """
 
     def __init__(
@@ -40,28 +42,34 @@ class ClimateDataset(Dataset):
         seed: int = 42,
         verbose: bool = True,
         use_anomalies: bool = True,
+        min_valid_ratio: float = 0.7,
     ):
         """
-        Initialize ClimateDataset.
+        Initialize the ClimateDataset.
 
         Args:
-            data: Climate data (T, H, W, C)
-            spi: SPI values (T, H, W) - required for classification
-            months: Month indices (T,)
-            p: History length (input timesteps)
-            q: Forecast horizon (timesteps ahead) - only for classification
-            spi_threshold: Threshold for binary classification
-            valid_mask: Validity mask (H, W)
-            use_weighted_sampling: If True, use weighted sampling
-            temporal_decay: If True, apply temporal decay to data
-            mode: 'autoencoder' or 'classification'
-            augmenter: Optional augmenter for extreme drought augmentation
-            seed: Random seed for reproducibility
-            verbose: If True, print information
-            use_anomalies: If True and mode='autoencoder', use monthly anomalies
+            data: Climate data (T, H, W, C).
+            spi: SPI values (T, H, W) - required for classification.
+            months: Month indices (T,).
+            p: History length (input timesteps).
+            q: Forecast horizon (timesteps ahead) - classification only.
+            spi_threshold: Threshold for binary classification.
+            valid_mask: Validity mask (H, W).
+            use_weighted_sampling: If True, expose per-sample weights for a
+                WeightedRandomSampler.
+            temporal_decay: If True, apply a linear temporal decay to the input.
+            mode: 'autoencoder' or 'classification'.
+            augmenter: Optional augmenter for extreme-drought augmentation.
+            seed: Random seed for reproducibility.
+            verbose: If True, print dataset information.
+            use_anomalies: If True and mode='autoencoder', use monthly anomalies.
+            min_valid_ratio: Minimum fraction of valid_mask pixels that must
+                have finite (non-NaN/Inf) data at a given timestep for that
+                timestep to be considered usable. Mirrors
+                ExperimentConfig.data.min_valid_ratio.
         """
         assert mode in ["autoencoder", "classification"], f"Invalid mode: {mode}"
-        
+
         # ============================================================
         # BASIC DATA
         # ============================================================
@@ -75,68 +83,70 @@ class ClimateDataset(Dataset):
         self.seed = seed
         self.augmenter = augmenter
         self.use_anomalies = use_anomalies and mode == "autoencoder"
-        
+        self.min_valid_ratio = min_valid_ratio
+        self.verbose = verbose
+
         T, H, W, C = data.shape
-        
+
         if verbose:
             print(f"  Dataset: T={T}, H={H}, W={W}, C={C}, p={p}, q={self.q}, mode={mode}")
             if self.use_anomalies:
-                print(f"  🔹 Using monthly anomalies for autoencoder training")
+                print("  🔹 Using monthly anomalies for autoencoder training")
             else:
-                print(f"  🔹 Using raw values for training")
+                print("  🔹 Using raw values for training")
             if augmenter is not None:
                 aug_info = augmenter.get_info() if hasattr(augmenter, 'get_info') else {}
                 print(f"  Augmentation: enabled ({aug_info})")
             else:
-                print(f"  Augmentation: disabled")
-        
+                print("  Augmentation: disabled")
+
         # ============================================================
         # VALIDITY MASK
         # ============================================================
         self.valid_mask = self._prepare_valid_mask(valid_mask, H, W)
         self.H, self.W = H, W
-        
+
         # ============================================================
         # TEMPORAL INDICES
         # ============================================================
         self.indices = self._build_indices()
-        
+
         # ============================================================
-        # TARGET FOR CLASSIFICATION
+        # CLASSIFICATION TARGET
         # ============================================================
         self.binary_mask = None
         if mode == "classification":
             self.binary_mask = self._prepare_binary_mask(H, W)
-        
+
         # ============================================================
         # STATISTICS
         # ============================================================
         self._compute_statistics()
-        
+
         # ============================================================
-        # WEIGHTS FOR SAMPLING
+        # SAMPLING WEIGHTS
         # ============================================================
         self.sample_weights = None
         if mode == "classification" and use_weighted_sampling:
             self.sample_weights = self._compute_sample_weights()
-        
+
         # ============================================================
-        # PREPARE DATA FOR TRAINING
+        # TRAINING DATA PREPARATION
         # ============================================================
         if self.use_anomalies:
             self.data_for_training = self._compute_anomalies(self.data, self.months)
         else:
             self.data_for_training = self.data
-        
-        # Rearrange for channels-first
+
+        # Channels-first layout for PyTorch.
         self.data_ch = np.transpose(self.data_for_training, (0, 3, 1, 2))
-        
-        # Temporal decay
+
+        # Linear temporal decay applied to the input sequence.
         if temporal_decay:
             self.temporal_weights = torch.linspace(0.5, 1.0, steps=p).view(p, 1, 1, 1)
         else:
             self.temporal_weights = None
-        
+
         if verbose:
             print(f"  ✅ Dataset initialized with {len(self.indices)} samples")
 
@@ -145,10 +155,10 @@ class ClimateDataset(Dataset):
     # ================================================================
 
     def _prepare_valid_mask(self, valid_mask: Optional[np.ndarray], H: int, W: int) -> Optional[np.ndarray]:
-        """Prepare and resize validity mask."""
+        """Resize the validity mask to match the data resolution, if needed."""
         if valid_mask is None:
             return None
-        
+
         if valid_mask.shape != (H, W):
             from skimage.transform import resize
             mask = resize(
@@ -159,14 +169,14 @@ class ClimateDataset(Dataset):
             ).astype(bool)
         else:
             mask = valid_mask
-        
+
         return mask
 
     def _prepare_binary_mask(self, H: int, W: int) -> np.ndarray:
-        """Prepare binary mask for classification."""
+        """Build the per-timestep binary drought mask for classification."""
         if self.spi is None:
             raise ValueError("SPI required for mode='classification'")
-        
+
         spi = self.spi
         if spi.shape[1:] != (H, W):
             from skimage.transform import resize
@@ -180,50 +190,32 @@ class ClimateDataset(Dataset):
                 )
             spi = spi_resized
             self.spi = spi
-        
+
         return (spi <= self.spi_threshold).astype(np.float32)
 
     # ================================================================
-    # TEMPORAL INDICES (OPÇÃO B - FORMAL)
+    # TEMPORAL INDICES
     # ================================================================
 
     def _build_indices(self) -> List[int]:
         """
-        Build list of valid temporal indices.
-        
-        ✅ CORREÇÃO: Verifica se TODOS os meses da sequência são válidos
+        Build the list of valid starting indices for sampling.
+
+        Delegates the actual per-timestep/window validity computation to
+        `preprocessing.build_temporal_valid_mask`, which is the single
+        source of truth for this logic (previously duplicated here).
         """
-        indices = []
-        T = len(self.data)
-        
-        # Verificar quais timesteps têm dados válidos
-        if self.valid_mask is not None:
-            # Para cada timestep, verificar se há pixels válidos
-            valid_timesteps = []
-            for t in range(T):
-                # Verificar se existe pelo menos um pixel válido neste timestep
-                if self.valid_mask.any():  # Simplificado - verificar melhor
-                    valid_timesteps.append(t)
-        else:
-            valid_timesteps = list(range(T))
-        
-        if self.mode == "autoencoder":
-            # Autoencoder: precisa de p meses consecutivos válidos
-            for t in range(T - self.p + 1):
-                # ✅ Verificar se TODOS os meses da sequência são válidos
-                if all(t + i in valid_timesteps for i in range(self.p)):
-                    indices.append(t)
-        else:
-            # Classification: precisa de p meses de entrada E q meses à frente
-            for t in range(T - self.p - self.q + 1):
-                # ✅ Verificar se TODOS os meses da entrada são válidos
-                if all(t + i in valid_timesteps for i in range(self.p)):
-                    # ✅ Verificar se o mês alvo é válido
-                    target_idx = t + self.p + self.q - 1
-                    if target_idx in valid_timesteps:
-                        indices.append(t)
-        
-        return indices
+        temporal_mask = build_temporal_valid_mask(
+            data_stack=self.data,
+            months=self.months,
+            valid_mask=self.valid_mask,
+            p=self.p,
+            q=self.q,
+            mode=self.mode,
+            min_valid_ratio=self.min_valid_ratio,
+            verbose=self.verbose,
+        )
+        return np.where(temporal_mask)[0].tolist()
 
     # ================================================================
     # ANOMALY COMPUTATION
@@ -231,37 +223,32 @@ class ClimateDataset(Dataset):
 
     def _compute_anomalies(self, data: np.ndarray, months: np.ndarray) -> np.ndarray:
         """
-        Compute monthly anomalies (departure from monthly climatology).
-        
+        Compute monthly anomalies (departure from the monthly climatology).
+
         Args:
-            data: (T, H, W, C) climate data
-            months: (T,) month indices (1-12)
-        
+            data: (T, H, W, C) climate data.
+            months: (T,) month indices (1-12).
+
         Returns:
-            Anomalies (T, H, W, C)
+            Anomalies (T, H, W, C).
         """
         T, H, W, C = data.shape
-        
-        # Initialize climatology arrays
+
         climatology = np.zeros((12, H, W, C), dtype=np.float32)
-        counts = np.zeros((12, 1, 1, 1), dtype=np.float32)
-        
-        # Calculate monthly climatology using valid pixels only
+        counts = np.zeros(12, dtype=np.float32)
+
         for t, month in enumerate(months):
             m = int(month) - 1  # 0-based index
             if self.valid_mask is not None:
                 mask_3d = self.valid_mask[:, :, np.newaxis]  # (H, W, 1)
                 climatology[m] += data[t] * mask_3d
-                counts[m] += mask_3d.sum(axis=(0, 1), keepdims=True)
             else:
                 climatology[m] += data[t]
-                counts[m] += 1
-        
-        # Avoid division by zero
+            counts[m] += 1  # occurrences of month m, NOT valid-pixel count
+
         counts = np.maximum(counts, 1)
-        climatology = climatology / counts
-        
-        # Compute anomalies
+        climatology = climatology / counts[:, np.newaxis, np.newaxis, np.newaxis]
+
         anomalies = np.zeros_like(data)
         for t, month in enumerate(months):
             m = int(month) - 1
@@ -270,7 +257,7 @@ class ClimateDataset(Dataset):
                 anomalies[t] = (data[t] - climatology[m]) * mask_3d
             else:
                 anomalies[t] = data[t] - climatology[m]
-        
+
         return anomalies
 
     # ================================================================
@@ -278,7 +265,7 @@ class ClimateDataset(Dataset):
     # ================================================================
 
     def _compute_statistics(self) -> None:
-        """Calculate dataset statistics."""
+        """Compute dataset-level statistics (drought prevalence, etc.)."""
         self.total_samples = len(self.indices)
         self.drought_samples = 0
         self.drought_ratio = 0.0
@@ -286,17 +273,17 @@ class ClimateDataset(Dataset):
         self.total_pixels = 1
         self.total_valid_pixels = 1
         self.drought_pixels = 0
-        
+
         if self.mode != "classification" or self.binary_mask is None:
             return
-        
+
         self.total_pixels = self.binary_mask[0].size
-        
+
         if self.valid_mask is not None:
             self.total_valid_pixels = self.valid_mask.sum()
         else:
             self.total_valid_pixels = self.total_pixels
-        
+
         if self.valid_mask is not None:
             drought_valid = 0
             for t in range(self.binary_mask.shape[0]):
@@ -304,20 +291,19 @@ class ClimateDataset(Dataset):
             self.drought_pixels = drought_valid
         else:
             self.drought_pixels = (self.binary_mask > 0).sum()
-        
-        # ✅ CORREÇÃO: target_idx = t + p + q - 1
+
         for t in self.indices:
             target_idx = t + self.p + self.q - 1
             if self.valid_mask is not None:
                 has_drought = (self.binary_mask[target_idx][self.valid_mask] > 0).any()
             else:
                 has_drought = (self.binary_mask[target_idx] > 0).any()
-            
+
             if has_drought:
                 self.drought_samples += 1
-        
+
         self.drought_ratio = self.drought_samples / self.total_samples if self.total_samples > 0 else 0
-        
+
         if self.valid_mask is not None:
             valid_pixels_count = self.valid_mask.sum()
             if valid_pixels_count > 0:
@@ -326,18 +312,17 @@ class ClimateDataset(Dataset):
             self.drought_prevalence = self.drought_pixels / (self.total_pixels * self.binary_mask.shape[0])
 
     # ================================================================
-    # WEIGHTS FOR SAMPLING
+    # SAMPLING WEIGHTS
     # ================================================================
 
     def _compute_sample_weights(self) -> np.ndarray:
-        """Calculate weights for balanced sampling."""
+        """Compute per-sample weights for balanced (oversampled) sampling."""
         weights = np.ones(len(self.indices), dtype=np.float32)
         drought_ratios = []
-        
+
         for t in self.indices:
-            # ✅ CORREÇÃO: target_idx = t + p + q - 1
             target_idx = t + self.p + self.q - 1
-            
+
             if self.valid_mask is not None:
                 mask = self.valid_mask
                 drought_pixels = (self.binary_mask[target_idx][mask] > 0).sum()
@@ -345,17 +330,17 @@ class ClimateDataset(Dataset):
             else:
                 drought_pixels = (self.binary_mask[target_idx] > 0).sum()
                 total_pixels = self.binary_mask[target_idx].size
-            
+
             ratio = drought_pixels / total_pixels if total_pixels > 0 else 0
             drought_ratios.append(ratio)
-        
+
         drought_ratios = np.array(drought_ratios)
         weights = 1.0 + 4.0 * drought_ratios
         weights = np.clip(weights, 0.5, 5.0)
-        
+
         if weights.sum() > 0:
             weights = weights / weights.sum()
-        
+
         return weights
 
     # ================================================================
@@ -368,56 +353,50 @@ class ClimateDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
         Return a dataset item.
-        
-        Opção B (formal):
-            - Entrada: X_t = [I_t, I_{t+1}, ..., I_{t+p-1}]
-            - Target: Y_t = B_{t+p+q-1}
+
+        Input:  X_t = [I_t, I_{t+1}, ..., I_{t+p-1}]
+        Target: Y_t = B_{t+p+q-1}
         """
         t = self.indices[idx]
-        
+
         # ============================================================
-        # INPUT: p instantes consecutivos
-        # X_t = [I_t, I_{t+1}, ..., I_{t+p-1}]
+        # INPUT: p consecutive timesteps
         # ============================================================
         x = torch.from_numpy(self.data_ch[t:t + self.p])
-        
-         # ✅ Garantir que não haja NaN/Inf no tensor
+
         x = torch.nan_to_num(x, nan=0.0)
         x = torch.where(torch.isinf(x), torch.zeros_like(x), x)
-        
+
         if self.temporal_weights is not None:
             x = x * self.temporal_weights
-        
-        # Classification mode
+
         if self.mode == "classification":
             # ============================================================
-            # TARGET: q-ésimo instante após o fim da janela
-            # Y_t = B_{t+p+q-1}
+            # TARGET: qth timestep after the end of the window
             # ============================================================
             target_idx = t + self.p + self.q - 1
             y_bin = self.binary_mask[target_idx]
-            
+
             if self.valid_mask is not None:
                 mask = torch.from_numpy(self.valid_mask.astype(np.float32))
             else:
                 mask = torch.ones_like(torch.from_numpy(y_bin))
-            
-            # Apply augmentation (if enabled)
+
             augmented = False
             if self.augmenter is not None:
                 x_np = x.numpy()
                 y_np = y_bin
                 mask_np = mask.numpy()
-                
+
                 x_aug, y_aug, mask_aug = self.augmenter(x_np, y_np, mask_np)
-                
+
                 x = torch.from_numpy(x_aug)
                 y_bin = y_aug
                 mask = torch.from_numpy(mask_aug)
-                
+
                 if hasattr(self.augmenter, 'was_applied'):
                     augmented = self.augmenter.was_applied()
-            
+
             return {
                 "x": x,
                 "y_bin": torch.from_numpy(y_bin).float(),
@@ -426,13 +405,13 @@ class ClimateDataset(Dataset):
                 "idx": idx,
                 "augmented": augmented,
             }
-        
+
         # Autoencoder mode
         if self.valid_mask is not None:
             mask = torch.from_numpy(self.valid_mask.astype(np.float32))
         else:
             mask = torch.ones((self.H, self.W), dtype=torch.float32)
-        
+
         return {
             "x": x,
             "mask": mask,
@@ -444,14 +423,14 @@ class ClimateDataset(Dataset):
     # ================================================================
 
     def get_sampler(self, seed: Optional[int] = None) -> Optional[WeightedRandomSampler]:
-        """Return a weighted sampler for balanced sampling."""
+        """Return a weighted sampler for balanced sampling, if enabled."""
         if self.sample_weights is None:
             return None
-        
+
         sampler_seed = seed if seed is not None else self.seed
         generator = torch.Generator()
         generator.manual_seed(sampler_seed)
-        
+
         return WeightedRandomSampler(
             weights=self.sample_weights,
             num_samples=len(self.sample_weights),
@@ -460,28 +439,28 @@ class ClimateDataset(Dataset):
         )
 
     def get_loss_mask(self) -> Optional[torch.Tensor]:
-        """Return the mask for loss calculation."""
+        """Return the validity mask used for loss computation."""
         if self.valid_mask is not None:
             return torch.from_numpy(self.valid_mask.astype(np.float32))
         return None
 
     def get_augmentation_stats(self) -> Dict[str, Any]:
-        """Return augmentation statistics."""
+        """Return information about the configured augmenter."""
         if self.augmenter is None:
             return {"enabled": False}
-        
+
         info = {
             "enabled": True,
             "type": self.augmenter.__class__.__name__,
         }
-        
+
         if hasattr(self.augmenter, 'get_info'):
             info.update(self.augmenter.get_info())
-        
+
         return info
-    
+
     def get_data_info(self) -> Dict[str, Any]:
-        """Return information about the dataset configuration."""
+        """Return a summary of the dataset configuration."""
         info = {
             "mode": self.mode,
             "p": self.p,
@@ -490,10 +469,10 @@ class ClimateDataset(Dataset):
             "use_anomalies": self.use_anomalies,
             "has_valid_mask": self.valid_mask is not None,
         }
-        
+
         if self.use_anomalies:
             info["data_type"] = "monthly_anomalies"
         else:
             info["data_type"] = "raw_values"
-        
+
         return info
